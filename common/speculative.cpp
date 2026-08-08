@@ -163,6 +163,8 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    virtual void set_enabled(llama_seq_id /*seq_id*/, bool /*enabled*/) {}
+
     virtual bool process(const llama_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
@@ -922,6 +924,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch_inject; // target features for KV cache injection
 
     std::vector<common_sampler_ptr> smpls;
+    std::vector<bool> enabled;
 
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
@@ -952,6 +955,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
         , params(params.draft)
+        , enabled(n_seq, true)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -981,6 +985,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        if (!this->params.p_min_by_pos.empty()) {
+            std::string thresholds;
+            for (float threshold : this->params.p_min_by_pos) {
+                thresholds += thresholds.empty() ? string_format("%.2f", threshold) : string_format(",%.2f", threshold);
+            }
+            LOG_INF("%s: - p_min_by_pos=%s\n", __func__, thresholds.c_str());
+        }
+        if (this->params.n_ctx_max > 0) {
+            LOG_INF("%s: - context_max=%d\n", __func__, this->params.n_ctx_max);
+        }
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
@@ -1046,10 +1060,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
-        if (pos_max < N - 1) {
+        if (enabled[seq_id] && pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
+        }
+    }
+
+    void set_enabled(llama_seq_id seq_id, bool value) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) enabled.size()) {
+            enabled[seq_id] = value;
         }
     }
 
@@ -1063,6 +1083,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+
+        if (params.n_ctx_max > 0 && batch_in.pos != nullptr) {
+            bool beyond_context_limit = true;
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                if (batch_in.pos[i] < params.n_ctx_max) {
+                    beyond_context_limit = false;
+                    break;
+                }
+            }
+            if (beyond_context_limit) {
+                return true;
+            }
+        }
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
@@ -1085,7 +1118,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
+            if (!enabled[seq_id] || i_batch_beg[seq_id] < 0) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
@@ -1162,7 +1195,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
+            if (!dp.drafting || !enabled[seq_id]) {
+                continue;
+            }
+            if (params.n_ctx_max > 0 && dp.n_past >= params.n_ctx_max) {
                 continue;
             }
 
@@ -1208,12 +1244,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const bool need_conf = params.p_min > 0.0f || !params.p_min_by_pos.empty();
+                const float * conf = need_conf ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
+                    const float p_min = params.p_min_by_pos.empty()
+                        ? params.p_min
+                        : params.p_min_by_pos[std::min((size_t) i, params.p_min_by_pos.size() - 1)];
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (p_min > 0.0f && conf[(size_t) idx * n_embd_dec] < p_min) {
                         break;
                     }
 
@@ -1247,8 +1287,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     const llama_token id = cur_p->data[0].id;
+                    const size_t position = (size_t) (i - 1);
+                    const float p_min = params.p_min_by_pos.empty()
+                        ? params.p_min
+                        : params.p_min_by_pos[std::min(position, params.p_min_by_pos.size() - 1)];
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (cur_p->data[0].p < p_min) {
                         break;
                     }
 
@@ -2578,6 +2622,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_enabled(common_speculative * spec, llama_seq_id seq_id, bool enabled) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_enabled(seq_id, enabled);
     }
 }
 

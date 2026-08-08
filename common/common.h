@@ -328,6 +328,12 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // Optional adaptive DSpark/DFlash policy. Position thresholds override
+    // p_min from left to right, repeating the final value when needed. A
+    // positive context limit disables draft work at and beyond that depth.
+    std::vector<float> p_min_by_pos;
+    int32_t n_ctx_max = 0;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;

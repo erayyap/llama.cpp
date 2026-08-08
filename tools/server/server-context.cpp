@@ -330,6 +330,9 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // True while this step intentionally bypasses draft-model work at the configured context limit.
+    bool spec_adaptive_raw = false;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -359,6 +362,7 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+        spec_adaptive_raw = false;
 
         task_prev = std::move(task);
         task.reset();
@@ -3006,8 +3010,14 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max();
 
+                slot.spec_adaptive_raw = false;
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
+
+                    const int32_t n_ctx_max = params_base.speculative.draft.n_ctx_max;
+                    slot.spec_adaptive_raw =
+                        n_ctx_max > 0 && slot.prompt.n_tokens() >= n_ctx_max && slot.spec_draft.empty();
+                    common_speculative_set_enabled(spec.get(), slot.id, !slot.spec_adaptive_raw);
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3145,6 +3155,14 @@ private:
                         slot.t_start_generation = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        if (slot.can_speculate()) {
+                            const int32_t n_ctx_max = params_base.speculative.draft.n_ctx_max;
+                            common_speculative_set_enabled(
+                                    spec.get(),
+                                    slot.id,
+                                    n_ctx_max <= 0 || slot.task->n_tokens() < n_ctx_max);
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3830,6 +3848,7 @@ private:
             const int64_t t_now = ggml_time_us();
 
             slot.n_decoded += 1;
+            slot.spec_adaptive_raw = false;
 
             if (slot.n_decoded == 1) {
                 slot.t_start_generation = t_now;

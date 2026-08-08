@@ -4020,6 +4020,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-p-min-by-pos"}, "P0,P1,...",
+        "minimum DSpark/DFlash confidence by draft position; the final value repeats for later positions",
+        [](common_params & params, const std::string & value) {
+            const auto items = string_split<std::string>(value, ',');
+            if (items.empty()) {
+                throw std::invalid_argument("at least one position threshold is required");
+            }
+
+            std::vector<float> thresholds;
+            thresholds.reserve(items.size());
+            for (auto item : items) {
+                item = string_strip(item);
+                size_t parsed = 0;
+                const float threshold = std::stof(item, &parsed);
+                if (parsed != item.size() || !std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+                    throw std::invalid_argument("position thresholds must be finite values in [0, 1]");
+                }
+                thresholds.push_back(threshold);
+            }
+            params.speculative.draft.p_min_by_pos = std::move(thresholds);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_BY_POS"));
+    add_opt(common_arg(
+        {"--spec-draft-context-max"}, "N",
+        "disable DSpark/DFlash draft processing at or beyond this active context depth (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("draft context maximum must be non-negative");
+            }
+            params.speculative.draft.n_ctx_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONTEXT_MAX"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
