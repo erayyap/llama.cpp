@@ -100,11 +100,24 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
-`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
+`--spec-draft-p-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
-(e.g. Gemma4) is planned.
+For hardware- and workload-calibrated scheduling,
+`--spec-draft-p-min-by-pos P0,P1,...` sets a separate threshold at each position and repeats the
+last value for any remaining positions. `--spec-draft-context-max N` switches to raw target
+sampling at and beyond context depth `N`, avoiding further draft forward passes and draft-model
+cache updates. For example:
+
+```bash
+--spec-draft-p-min 0.45 \
+--spec-draft-p-min-by-pos 0.45,0.55,0.60,0.65,0.70 \
+--spec-draft-context-max 81920
+```
+
+The position thresholds and context limit are disabled unless explicitly supplied. Calibrate
+both against raw decoding on the deployment hardware; higher acceptance alone does not imply
+higher throughput.
 
 See:
 

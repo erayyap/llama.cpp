@@ -55,6 +55,9 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// enable or disable speculative-model work for a sequence
+void common_speculative_set_enabled(common_speculative * spec, llama_seq_id seq_id, bool enabled);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
