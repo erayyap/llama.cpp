@@ -3800,6 +3800,13 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         result.block_cols = (D & 8) ? 64 : 32;
     }
 
+    // Optional decode specialization: keep two-row verification on the exact N=1 tile.
+    static const bool scalar_decode_tile = getenv("GGML_VK_FA_SCALAR_DECODE_TILE") != nullptr;
+    if (scalar_decode_tile && n_rows == 2) {
+        result.block_rows = 1;
+        result.block_cols = 64;
+    }
+
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
 
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
@@ -3924,6 +3931,11 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
 static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
+
+    static const bool force_scalar = getenv("GGML_VK_FA_FORCE_SCALAR") != nullptr;
+    if (force_scalar && n_rows == 2) {
+        path = FA_SCALAR;
+    }
 
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
