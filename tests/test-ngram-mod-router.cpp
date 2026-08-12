@@ -1,4 +1,5 @@
 #include "ngram-mod.h"
+#include "speculative.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -129,6 +130,30 @@ int main() {
         router.accept(12);
         draft.clear();
         require(!router.draft(prompt, source[23], 64, draft).selected);
+    }
+
+    {
+        common_params_speculative params;
+        params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MOD, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        params.ngram_mod.n_match = config.n_match;
+        params.ngram_mod.n_min = config.n_min;
+        params.ngram_mod.n_max = config.n_max;
+        params.draft.n_ctx_max = config.n_ctx_max;
+        common_speculative_ptr spec(common_speculative_init(params, 1));
+
+        const auto prompt = reliable_prompt(source);
+        tokens draft;
+        common_speculative_begin(spec.get(), 0, prompt);
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, 64, (llama_pos) prompt.size(), source[23], &prompt, &draft, nullptr,
+        };
+        common_speculative_draft(spec.get());
+        require(!draft.empty());
+        require(common_speculative_last_type(spec.get(), 0) == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+
+        common_speculative_draft(spec.get());
+        require(common_speculative_last_type(spec.get(), 0) == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        common_speculative_accept(spec.get(), 0, 12);
     }
 
     std::cout << "adaptive ngram router tests passed\n";
