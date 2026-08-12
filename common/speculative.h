@@ -70,6 +70,9 @@ bool common_speculative_need_embd_nextn(common_speculative * spec);
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// return the implementation selected by the most recent draft call
+common_speculative_type common_speculative_last_type(common_speculative * spec, llama_seq_id seq_id);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

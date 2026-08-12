@@ -1901,8 +1901,10 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
-    // shared across all sequences
+    // The adaptive DSpark router uses request-local indexes instead of this legacy shared table.
     common_ngram_mod mod;
+    const bool adaptive;
+    std::vector<common_ngram_mod_router> routers;
 
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
@@ -1926,12 +1928,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
         , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , adaptive(std::find(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.types.end())
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
-        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
-                this->params.n_match, this->params.n_max, this->params.n_min);
+        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d, adaptive=%d\n",
+                this->params.n_match, this->params.n_max, this->params.n_min, adaptive);
         SPC_TRC("- mod size=%zu (%.3f MB)\n",
                 mod.size(), (float)(mod.size_bytes())/1024/1024);
 
@@ -1941,6 +1944,15 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+        routers.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            routers.emplace_back(common_ngram_mod_router_config {
+                this->params.n_match,
+                this->params.n_min,
+                this->params.n_max,
+                params.draft.n_ctx_max,
+            });
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1948,6 +1960,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_low = 0;
+
+        if (adaptive) {
+            routers[seq_id].begin(prompt);
+            return;
+        }
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -1980,6 +1998,17 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const auto & prompt = *dparams.prompt;
 
         sinfo.n_draft_last = 0;
+
+        if (adaptive) {
+            const auto route = routers[seq_id].draft(prompt, dparams.id_last, dparams.n_max, result);
+            sinfo.n_draft_last = result.size();
+            if (route.selected) {
+                SPC_DBG("ngram route seq=%d width=%d threshold=%d occurrences=%d agreement=%d copy_run=%d source=%s\n",
+                        seq_id, route.width, route.threshold, route.occurrences, route.agreement,
+                        route.copy_run, route.from_prompt ? "prompt" : "generated");
+            }
+            return;
+        }
 
         const size_t cur_len = prompt.size();
         if (cur_len < mod.get_n()) {
@@ -2051,6 +2080,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         auto & sinfo = sinfos[seq_id];
+
+        if (adaptive) {
+            routers[seq_id].accept(n_accepted);
+            return;
+        }
 
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
@@ -2618,6 +2652,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    spec->impl_last[seq_id] = nullptr;
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -2683,6 +2718,7 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     auto & dparams = spec->dparams;
+    std::fill(spec->impl_last.begin(), spec->impl_last.end(), nullptr);
 
     {
         int n_drafting = 0;
@@ -2756,6 +2792,13 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+common_speculative_type common_speculative_last_type(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->impl_last[seq_id] == nullptr) {
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+    return spec->impl_last[seq_id]->type;
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

@@ -182,7 +182,11 @@ Some characteristics:
 - Constant memory and complexity
 - Can generate variable draft lengths (i.e. m is not fixed)
 
-Currently, a single hash pool is shared across all server slots, so different requests can benefit from each other.
+A standalone `ngram-mod` configuration uses one hash pool shared across server slots.
+
+When `ngram-mod` is combined with `draft-dspark`, the Strix research fork enables a conservative adaptive router. It builds a position-only index for each request, requires continuation agreement, an established copy run, or prior acceptance in the same aligned region, and uses DSpark otherwise. The first selected lookup uses the configured minimum width. The router promotes to the maximum width after two strong passes and starts a four-pass cooldown after one result below its cost-derived threshold. These thresholds come from measured target verification costs: at 16K, K32/K48/K64 require about 25/27/35 accepted tokens to match DSpark; at 64K they require about 28/31/35. Routing adds a four-token safety margin. Request-local indexes, cooldown, and acceptance state are cleared when the next request begins. The DSpark context cutoff also applies to lookup routing.
+
+The adaptive state is not serialized with context checkpoints. Checkpoints only replay an in-progress verification; a new request always rebuilds the router from its own prompt.
 
 **Sample usage:**
 
@@ -209,7 +213,7 @@ Example Video:
 
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
 - ngram-map-k looks for a previous matching n-gram and inserts the following m-gram but uses an internal hash-map of n-grams in the current context window.
-- ngram-mod uses a hash pool which is shared across all server slots. The hash pool is a map from n-gram hash to the next token (not the next m-gram as in ngram-map).
+- ngram-mod alone uses a hash pool shared across all server slots. In the Strix `ngram-mod,draft-dspark` combination, the adaptive request-local router replaces that lookup path.
 
 ## Command-Line Options
 
