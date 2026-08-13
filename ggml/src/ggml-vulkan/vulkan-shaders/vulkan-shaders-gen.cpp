@@ -803,8 +803,9 @@ void process_shaders() {
     string_to_spv("lightning_indexer_f16", "lightning_indexer.comp", {});
     string_to_spv("lightning_indexer_q8_0", "lightning_indexer.comp", {{"DATA_K_Q8_0", "1"}});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    string_to_spv("lightning_indexer_cm_f16", "lightning_indexer_cm.comp", {});
-    string_to_spv("lightning_indexer_cm_q8_0", "lightning_indexer_cm.comp", {{"DATA_K_Q8_0", "1"}});
+    string_to_spv("lightning_indexer_cm_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "8"}, {"HEADS_PER_TILE", "4"}});
+    string_to_spv("lightning_indexer_cm_q8_0", "lightning_indexer_cm.comp", {{"DATA_K_Q8_0", "1"}, {"N_WAVES", "8"}, {"HEADS_PER_TILE", "4"}});
+    string_to_spv("lightning_indexer_cm_small_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "1"}, {"HEADS_PER_TILE", "1"}});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
     string_to_spv("lightning_indexer_decode_cm_q8_0", "lightning_indexer_decode_cm.comp", {{"DATA_K_Q8_0", "1"}});
     string_to_spv("lightning_indexer_topk_decode_cm_f16", "lightning_indexer_topk_decode_cm.comp", {});
