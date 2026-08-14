@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -932,6 +933,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // Optional request-local depth adaptation. DSpark's ideal block size is highly
+    // workload-dependent: long drafts win when acceptance is high (for example code),
+    // while low-acceptance prose wastes verification work. Keep this opt-in so the
+    // upstream/static behavior remains unchanged by default.
+    bool                 adaptive_depth = false;
+    std::vector<int32_t> adaptive_n;
+    std::vector<int32_t> last_drafted;
+    std::vector<float>   acceptance_ema;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -986,6 +996,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
 
+        const char * adaptive_env = std::getenv("LLAMA_DSPARK_ADAPTIVE");
+        adaptive_depth = is_dspark && adaptive_env != nullptr && std::strcmp(adaptive_env, "0") != 0;
+        adaptive_n.assign(n_seq, std::min(2, this->params.n_max));
+        last_drafted.assign(n_seq, 0);
+        acceptance_ema.assign(n_seq, 0.5f);
+        if (adaptive_depth) {
+            LOG_INF("%s: adaptive DSpark depth enabled (request-local range 2..%d)\n",
+                    __func__, this->params.n_max);
+        }
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1017,6 +1037,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+
+        if (adaptive_depth) {
+            adaptive_n[seq_id]     = std::min(2, params.n_max);
+            last_drafted[seq_id]   = 0;
+            acceptance_ema[seq_id] = 0.5f;
         }
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
@@ -1144,7 +1170,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = adaptive_depth ? adaptive_n[seq_id] : params.n_max;
+            last_drafted[seq_id] = n_draft;
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1237,8 +1264,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (!adaptive_depth || is_other || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int32_t n_draft = last_drafted[seq_id];
+        if (n_draft <= 0) {
+            return;
+        }
+
+        // Smooth content-dependent variance. Hysteresis ramps only under
+        // consistently strong acceptance and retreats quickly on misses.
+        const float ratio = std::min<float>(n_accepted, n_draft) / n_draft;
+        float & ema = acceptance_ema[seq_id];
+        ema = 0.75f * ema + 0.25f * ratio;
+
+        const int32_t old_n = adaptive_n[seq_id];
+        if (ema >= 0.82f && adaptive_n[seq_id] < params.n_max) {
+            adaptive_n[seq_id]++;
+            ema = 0.75f; // require fresh evidence before increasing again
+        } else if (ema < 0.55f && adaptive_n[seq_id] > std::min(2, params.n_max)) {
+            adaptive_n[seq_id]--;
+            ema = 0.65f;
+        }
+
+        if (old_n != adaptive_n[seq_id]) {
+            LOG_DBG("%s: seq %d adaptive DSpark depth %d -> %d (accepted=%u/%d, ema=%.3f)\n",
+                    __func__, seq_id, old_n, adaptive_n[seq_id], n_accepted, n_draft, ema);
+        }
     }
 
     bool need_embd() const override {
