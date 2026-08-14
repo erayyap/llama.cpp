@@ -1836,8 +1836,8 @@ struct vk_op_dsv4_hc_post_push_constants {
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
 struct vk_op_flash_attn_gather_push_constants {
-    uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
-    uint32_t nbk1, nbk3, nbt3, nbm3, nem3;
+    uint32_t n_kv, n_batch, n_kv_raw, n_top_k, kv_c;
+    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3;
 };
 static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
 
@@ -11264,12 +11264,11 @@ struct vk_fa_compact_state {
 };
 
 // V4 sparse decode (gather-to-compact): the sparse prefill shader above gates on
-// q->ne[1] >= 64, so single-token decode otherwise attends densely over the whole
-// compressed KV, at a cost that grows with context. Instead, gather the active rows
-// (dense prefix + top-k selection; MQA, so all query heads share one set) into a
-// compact contiguous scratch in prealloc_y, and let the ordinary dense FA below run
-// over the compacted K/V/mask. Correct by the same contract as the sparse shader:
-// the source mask carries the selection, and the gathered mask preserves it.
+// q->ne[1] >= 64, so decode and small speculative batches otherwise attend densely
+// over the whole compressed KV. Gather the raw prefix plus one top-k segment per query
+// into a compact shared K scratch, and build a compact per-query mask that exposes only
+// that query's segment. The ordinary dense FA then runs over the compact K/V/mask.
+// This preserves the source mask's exact causal and sparse-selection semantics.
 static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
         const ggml_tensor * mask, ggml_tensor * dst, vk_fa_compact_state & st) {
@@ -11281,12 +11280,13 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
                             ctx->device->pipeline_flash_attn_gather_q8_0;
     if ((gather_env && gather_env[0] == '0') ||
         !top_k || (!gather_f16 && !gather_q8) ||
-        q->ne[1] != 1 ||    // single-token decode only; batched queries need a union gather
+        q->ne[1] < 1 || q->ne[1] > 8 || // decode/speculative verification only
         q->type != GGML_TYPE_F32 ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 || q->ne[2] != 64 ||
         k->ne[2] != 1 || v->ne[2] != 1 ||
         q->ne[1] != top_k->ne[1] || q->ne[3] != top_k->ne[3] ||
+        mask->ne[1] != q->ne[1] ||
         k->ne[1] != v->ne[1] || k->buffer != v->buffer || k->data != v->data ||
         !ggml_is_contiguous(mask) || !ggml_is_contiguous(top_k)) {
         return false;
@@ -11305,16 +11305,17 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         return false;
     }
 
-    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + top_k->ne[0]), 256u);
-    // the gather writes then re-reads ~the active bytes; dense reads the source KV once,
-    // so compaction only pays when the source is comfortably larger than the active set
+    const uint32_t n_batch = (uint32_t) q->ne[1];
+    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + n_batch * top_k->ne[0]), 256u);
+    // The compact K contains one selected segment per query. Compaction only pays
+    // when the full source is comfortably larger than that concatenated active set.
     if ((uint64_t) k->ne[1] < 2ull * kv_c) {
         return false;
     }
 
     const uint32_t ns    = (uint32_t) q->ne[3];
     const size_t   kc_sz = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
-    const size_t   mc_sz = (size_t) ns * kv_c * sizeof(ggml_fp16_t);
+    const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
     if (ctx->prealloc_size_y < kc_sz + mc_sz) {
         ctx->prealloc_size_y = kc_sz + mc_sz;
@@ -11330,10 +11331,12 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
 
     const size_t k_storage_size = ggml_type_size(k->type);
     const vk_op_flash_attn_gather_push_constants pc = {
-        (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
+        (uint32_t) k->ne[1], n_batch, (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
         (uint32_t) (k->nb[1] / k_storage_size),
         (uint32_t) (k->nb[3] / k_storage_size),
+        (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
+        (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) mask->ne[3],
     };

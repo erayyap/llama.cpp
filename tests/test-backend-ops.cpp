@@ -9904,6 +9904,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  1, 1024, 512, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  2, 1024, 512, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  5, 1024, 512, true, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
@@ -10345,7 +10347,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int nb : { 1, 8, 64, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false));
         }
-        test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1, 1024, 512, false, GGML_TYPE_Q8_0));
+        for (int nb : { 1, 2, 3, 5, 6 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false, GGML_TYPE_Q8_0));
+        }
     }
 
     return test_cases;

@@ -9,11 +9,13 @@
 #endif
 
 // Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA decode) into a
-// compact contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), then the
-// n_top_k selected rows, then zero padding up to kv_c. The gathered mask row keeps the
-// per-key mask values so causality/validity survive compaction; invalid top-k indices and
-// padding get -inf mask and zeroed K (softmax-neutral either way, zeroed so no NaN*0).
-// One workgroup per compact row; V is the K latent (V==K), so a single gather serves both.
+// compact contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), followed
+// by one n_top_k segment for each query token, then zero padding up to kv_c. Each query's
+// compact mask exposes the raw prefix and only its own selected segment. This deliberately
+// keeps duplicate selections across queries: it avoids a GPU union/hash pass and is small for
+// speculative batches (<= 8), while still removing the full-context scan. Invalid top-k
+// indices and padding get -inf masks and zeroed K. V is the K latent (V==K), so one gather
+// serves both.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -29,12 +31,15 @@ layout(binding = 4) writeonly buffer McBuf  { float16_t data_mc[];  };
 
 layout(push_constant) uniform Parameters {
     uint n_kv;     // total source KV rows
+    uint n_batch;  // query tokens sharing this compact K scratch
     uint n_kv_raw; // dense prefix length
-    uint n_top_k;  // selected rows for the (single) query token
+    uint n_top_k;  // selected rows per query token
     uint kv_c;     // padded compact row count == dispatch row range
     uint nbk1;     // K source row stride, storage units (f16 elements or q8_0 blocks)
     uint nbk3;     // K source stream stride, storage units
+    uint nbt1;     // top_k query stride, elements
     uint nbt3;     // top_k stream stride, elements
+    uint nbm1;     // mask query stride, elements
     uint nbm3;     // mask source stream stride, elements
     uint nem3;     // mask ne[3], for stream broadcast
 } p;
@@ -47,12 +52,17 @@ void main() {
     const uint stream = gl_WorkGroupID.z;
     const uint tid    = gl_LocalInvocationIndex;
 
-    // map compact row -> source row; p.n_kv is the invalid sentinel
+    // Map compact row -> source row. `owner == n_batch` denotes the shared raw
+    // prefix; p.n_kv is the invalid source sentinel for padding/bad indices.
     uint src = p.n_kv;
+    uint owner = p.n_batch;
     if (row < p.n_kv_raw) {
         src = row;
-    } else if (row < p.n_kv_raw + p.n_top_k) {
-        const int idx = data_top[stream * p.nbt3 + (row - p.n_kv_raw)];
+    } else if (row < p.n_kv_raw + p.n_batch * p.n_top_k) {
+        const uint selected = row - p.n_kv_raw;
+        owner = selected / p.n_top_k;
+        const uint top_pos = selected - owner * p.n_top_k;
+        const int idx = data_top[stream * p.nbt3 + owner * p.nbt1 + top_pos];
         if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
             src = p.n_kv_raw + uint(idx);
         }
@@ -76,15 +86,21 @@ void main() {
             data_kc[dst_base + tid + i * LANES] = data_k[src_base + tid + i * LANES];
         }
 #endif
-        if (tid == 0) {
-            data_mc[stream * p.kv_c + row] = data_m[(stream % p.nem3) * p.nbm3 + src];
-        }
     } else {
         [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
             data_kc[dst_base + tid + i * LANES] = float16_t(0.0);
         }
-        if (tid == 0) {
-            data_mc[stream * p.kv_c + row] = float16_t(uintBitsToFloat(0xff800000));
+    }
+
+    // The compact K is shared by every query, but selected segments are private.
+    // Copy the original mask for the raw prefix and the owning query's segment;
+    // all cross-query segments, invalid indices, and padding remain masked.
+    if (tid < p.n_batch) {
+        const uint query = tid;
+        float16_t value = float16_t(uintBitsToFloat(0xff800000));
+        if (src < p.n_kv && (owner == p.n_batch || owner == query)) {
+            value = data_m[(stream % p.nem3) * p.nbm3 + query * p.nbm1 + src];
         }
+        data_mc[(stream * p.n_batch + query) * p.kv_c + row] = value;
     }
 }
