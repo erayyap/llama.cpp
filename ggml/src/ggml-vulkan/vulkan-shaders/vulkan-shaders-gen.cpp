@@ -823,6 +823,8 @@ void process_shaders() {
         string_to_spv("flash_attn_gather_dq_" + std::string(tname), "flash_attn_gather_dq.comp",
                       {{"DATA_A_" + to_uppercase(tname), "1"}});
     }
+    string_to_spv("flash_attn_union_f16", "flash_attn_union.comp", {});
+    string_to_spv("flash_attn_gather_union_f16", "flash_attn_gather_union.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});

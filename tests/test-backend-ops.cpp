@@ -6948,14 +6948,15 @@ struct test_flash_attn_ext_top_k : public test_case {
     const int64_t n_kv_raw; // dense prefix always attended
     const int64_t n_top_k;  // selected keys per query token
     const bool    sinks;
-    const ggml_type type_K; // cache storage; q8_0 exercises decode gather+dequant
+    const ggml_type type_K; // cache storage
     const int64_t ns;       // independent sequence/stream count
+    const int64_t ov;       // percent of each token's picks shared with neighbours
 
     static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
     static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
 
     std::string vars() override {
-        return VARS_TO_STR7(kv, nb, n_kv_raw, n_top_k, sinks, type_K, ns);
+        return VARS_TO_STR8(kv, nb, n_kv_raw, n_top_k, sinks, type_K, ns, ov);
     }
 
     double max_nmse_err() override {
@@ -6970,8 +6971,8 @@ struct test_flash_attn_ext_top_k : public test_case {
     }
 
     test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128,
-            bool sinks = false, ggml_type type_K = GGML_TYPE_F16, int64_t ns = 1)
-        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), type_K(type_K), ns(ns) {}
+            bool sinks = false, ggml_type type_K = GGML_TYPE_F16, int64_t ns = 1, int64_t ov = 0)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), type_K(type_K), ns(ns), ov(ov) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
@@ -7035,7 +7036,10 @@ struct test_flash_attn_ext_top_k : public test_case {
                     mask[mask_base + i] = i < n_kv_raw ? zero : minus_inf;
                 }
                 for (int64_t j = 0; j < n_top_k; ++j) {
-                    int32_t idx = (int32_t) ((j * range) / n_top_k + b + sidx) % (int32_t) range;
+                    const bool shared = (int64_t) j * 100 < n_top_k * ov;
+                    int32_t idx = shared
+                        ? (int32_t) ((j * range) / n_top_k + sidx * 7) % (int32_t) range
+                        : (int32_t) ((j * range) / n_top_k + b + sidx * 7) % (int32_t) range;
                     if (j == n_top_k - 1 && b == 0 && sidx == 0) {
                         idx = -1; // exercise the ignore-invalid-index path
                     } else {
@@ -10025,6 +10029,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(1024,  64,  65, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 257, 256, 512, false));
+    // Deduplicated-union correctness at realistic overlap and verifier widths.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 4, 1024, 512, false, GGML_TYPE_F16, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(35584, 8, 2304, 512, false, GGML_TYPE_F16, 1, 60));
     // Quantized sparse-prefill caches are dequantized once into f16 scratch.
     for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, tk, 1));
@@ -10530,6 +10537,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         for (int kv : { 5504, 11008, 19200, 35584 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1024, 2304, 512, false, tk));
+        }
+    }
+    // Same shapes with realistic adjacent-token overlap. Measured on DeepSeek-V4-Flash the
+    // real overlap is 60% over 4 adjacent tokens and 76% over 8; the default generator is
+    // near 0%, which would make a deduplicated union look worthless by construction.
+    for (int kv : { 35584, 133888 }) {
+        for (int nb : { 2, 4, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 2304, 512, false, GGML_TYPE_F16, 1, 60));
         }
     }
 

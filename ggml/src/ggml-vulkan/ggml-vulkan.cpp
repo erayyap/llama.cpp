@@ -64,6 +64,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
+#include <unordered_set>
 #include <future>
 #include <condition_variable>
 #include <thread>
@@ -1052,6 +1053,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_q8_0;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_flash_attn_union_f16;
+    vk_pipeline pipeline_flash_attn_gather_union_f16;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -1863,6 +1866,12 @@ struct vk_op_dsv4_hc_post_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
+struct vk_op_flash_attn_union_push_constants {
+    uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to;
+};
+struct vk_op_flash_attn_gather_union_push_constants {
+    uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch;
+};
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_batch, n_kv_raw, n_top_k, kv_c;
     uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, n_streams, nem3;
@@ -3948,14 +3957,16 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
+                                                  bool use_dynamic_kv = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (use_dynamic_kv    ? 16 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4614,7 +4625,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         }
-        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
+        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -4650,7 +4661,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -4687,7 +4698,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm2_data;        spv_size = flash_attn_f32_f16_cm2_len;        name = "flash_attn_f32_f16_f32acc_cm2"; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm2_data; spv_size = flash_attn_f32_f16_f16acc_cm2_len; name = "flash_attn_f32_f16_f16acc_cm2"; }
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true, false, 0);
         }
@@ -6260,6 +6271,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q4_0, q4_0)
         CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q8_0, q8_0)
 #undef CREATE_FA_GATHER_TOK_DQ
+        if (device->subgroup_arithmetic) {
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_union_f16,
+                "flash_attn_union_f16", flash_attn_union_f16_len, flash_attn_union_f16_data, "main", 3,
+                sizeof(vk_op_flash_attn_union_push_constants), {1, 1, 1}, {}, 1, true, true,
+                device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_f16,
+                "flash_attn_gather_union_f16", flash_attn_gather_union_f16_len, flash_attn_gather_union_f16_data, "main", 6,
+                sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
+                device->subgroup_size);
+        }
     }
 
     // DSv4 fused hyper-connection ops: plain f32 compute, no subgroup/coopmat requirements
@@ -11436,6 +11457,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                                            : (uint32_t) k->nb[2];
     const uint32_t k_nb3_byte = dequant_kv ? (uint32_t) (k_nb3_el * sizeof(ggml_fp16_t)) : (uint32_t) k->nb[3];
 
+
     vk_op_flash_attn_top_k_push_constants pc = {
         (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) n_kv_raw,
         (uint32_t) top_k->ne[0], (uint32_t) q->ne[2],
@@ -11553,7 +11575,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                     };
 
                     ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
-                        {tile_q, k_buf, k_buf, tile_mask, tile_q, split_buf, tile_q},
+                        {tile_q, k_buf, k_buf, tile_mask, tile_q, split_buf, tile_q, tile_q /* dyn-KV: unused */},
                         raw_pc, {tile_n, NH, NS});
                     ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_RAW (sub-op)");
 
@@ -11588,10 +11610,12 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 
 struct vk_fa_compact_state {
     bool active = false;
-    uint32_t kv_c = 0;
+    bool dynamic_kv = false;      // union KV row count lives in kv_buf, not the push constant
+    uint32_t kv_c = 0;            // fixed query-private size or dynamic union upper bound
     uint32_t n_batch = 0;
     size_t kc_query_stride = 0;
     size_t mc_query_stride = 0;
+    vk_subbuffer kv_buf;
     vk_subbuffer kc_buf, mc_buf;
 };
 
@@ -11651,6 +11675,69 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         return false;
     }
 
+    // ---- deduplicated union (GGML_VK_FA_TOPK_UNION=1) ----------------------------------
+    // Build one row per distinct selected key. The target FA reads the padded runtime
+    // union count from a device buffer; the local query-private path remains the fallback.
+    static const char * union_env = getenv("GGML_VK_FA_TOPK_UNION");
+    if (union_env && union_env[0] == '1' && gather_f16 && q->ne[3] == 1 && n_batch > 1 &&
+        ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16) {
+        const uint32_t max_union = (uint32_t) ((int64_t) n_batch * top_k->ne[0]);
+        const uint32_t union_kv_c = GGML_PAD((uint32_t) n_kv_raw + max_union, 256u);
+        const uint32_t max_words = 12288;
+        const uint32_t need_words = (uint32_t) (((k->ne[1] - n_kv_raw) + 31) / 32);
+        // The first union revision uses the conservative worst-case compaction gate.
+        if (need_words <= max_words && (uint64_t) k->ne[1] >= 2ull * union_kv_c) {
+            const size_t ukc_sz = (size_t) union_kv_c * 512 * sizeof(ggml_fp16_t);
+            const size_t umc_sz = (size_t) n_batch * union_kv_c * sizeof(ggml_fp16_t);
+            const size_t ul_sz  = (size_t) max_union * sizeof(uint32_t);
+            const size_t uc_sz  = 2 * sizeof(uint32_t);
+            const size_t need   = ukc_sz + umc_sz + ul_sz + uc_sz;
+            if (ctx->prealloc_size_y < need) {
+                ctx->prealloc_size_y = need;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            const vk_subbuffer kc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+            const vk_subbuffer mc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, ukc_sz);
+            const vk_subbuffer ul_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, ukc_sz + umc_sz);
+            const vk_subbuffer uc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, ukc_sz + umc_sz + ul_sz);
+
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_gather_union_f16, 1);
+
+            const vk_op_flash_attn_union_push_constants upc = {
+                (uint32_t) k->ne[1], (uint32_t) n_kv_raw, n_batch, (uint32_t) top_k->ne[0], max_union,
+                (uint32_t) (top_k->nb[1] / sizeof(int32_t)), max_words, 256u,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
+                { ggml_vk_tensor_subbuffer(ctx, top_k), ul_buf, uc_buf }, upc, { 1, 1, 1 });
+            ggml_vk_sync_buffers(ctx, subctx);
+
+            const vk_op_flash_attn_gather_union_push_constants gpc = {
+                (uint32_t) k->ne[1], (uint32_t) n_kv_raw, union_kv_c,
+                (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
+                (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
+                n_batch,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
+                { ggml_vk_tensor_subbuffer(ctx, k), ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
+                  kc_buf, mc_buf, uc_buf }, gpc, { union_kv_c, 1, 1 });
+            ggml_vk_sync_buffers(ctx, subctx);
+            ctx->prealloc_y_need_sync = true;
+
+            st.active     = true;
+            st.dynamic_kv = true;
+            st.kv_c       = union_kv_c;
+            st.n_batch    = n_batch;
+            st.kc_buf     = kc_buf;
+            st.mc_buf     = mc_buf;
+            st.kv_buf     = uc_buf;
+            return true;
+        }
+    }
+
     const uint32_t ns = (uint32_t) q->ne[3];
     const size_t kc_query_stride = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
     const size_t mc_query_stride = (size_t) ns * kv_c * sizeof(ggml_fp16_t);
@@ -11692,6 +11779,53 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         pc, { kv_c, 1, ns * n_batch });
     ggml_vk_sync_buffers(ctx, subctx);
     ctx->prealloc_y_need_sync = true;
+
+    // ---- diagnostic: measure real top-k overlap between the query tokens ----------------
+    // GGML_VK_TOPK_OVERLAP=1. Off by default and never touched on the hot path. Answers the
+    // one question that decides whether a deduplicated union is worth building: this path
+    // gathers n_batch*n_top_k rows, a union would gather |union| rows, and the op's cost is
+    // linear in that count (measured: 204.4 / 205.7 / 205.5 us per row at batch 2 / 4 / 8).
+    // Needs a real model - synthetic top-k selections say nothing about real overlap, which
+    // is exactly how the mul_mat_id large-tile probe misled once before.
+    static const char * overlap_env = getenv("GGML_VK_TOPK_OVERLAP");
+    if (overlap_env && overlap_env[0] == '1' && n_batch > 1) {
+        static std::mutex        ov_mutex;
+        static uint64_t          ov_calls = 0, ov_selected = 0, ov_union = 0;
+        static std::map<uint32_t, std::pair<uint64_t, uint64_t>> ov_by_batch; // n_batch -> {selected, union}
+        const size_t n_idx = (size_t) n_batch * top_k->ne[0];
+        std::vector<int32_t> idx(n_idx);
+        vk_subbuffer top_sb = ggml_vk_tensor_subbuffer(ctx, top_k);
+        ggml_vk_buffer_read(top_sb.buffer, top_sb.offset, idx.data(), n_idx * sizeof(int32_t));
+
+        const int32_t range = (int32_t) (k->ne[1] - n_kv_raw);
+        std::unordered_set<int32_t> uni;
+        uint64_t valid = 0;
+        for (size_t i = 0; i < n_idx; ++i) {
+            const int32_t v = idx[i];
+            if (v >= 0 && v < range) { uni.insert(v); ++valid; }
+        }
+        std::lock_guard<std::mutex> lock(ov_mutex);
+        ov_calls++; ov_selected += valid; ov_union += uni.size();
+        auto & e = ov_by_batch[n_batch];
+        e.first += valid; e.second += uni.size();
+        if ((ov_calls % 256) == 0) {
+            fprintf(stderr, "[topk-overlap] calls=%llu  selected=%llu  union=%llu  "
+                            "union/selected=%.3f  => a dedup union would gather %.1f%% fewer compressed rows\n",
+                    (unsigned long long) ov_calls, (unsigned long long) ov_selected,
+                    (unsigned long long) ov_union,
+                    ov_selected ? (double) ov_union / (double) ov_selected : 0.0,
+                    ov_selected ? 100.0 * (1.0 - (double) ov_union / (double) ov_selected) : 0.0);
+            for (const auto & kv : ov_by_batch) {
+                const double ratio = kv.second.first ? (double) kv.second.second / (double) kv.second.first : 0.0;
+                // projected op speedup uses the measured linear cost model on kv_c
+                const double now  = (double) n_kv_raw + (double) kv.first * (double) top_k->ne[0];
+                const double dedup = (double) n_kv_raw + ratio * (double) kv.first * (double) top_k->ne[0];
+                fprintf(stderr, "[topk-overlap]   n_batch=%u  union/selected=%.3f  "
+                                "kv_c %.0f -> %.0f  projected op gain %.1f%%\n",
+                        kv.first, ratio, now, dedup, 100.0 * (1.0 - dedup / now));
+            }
+        }
+    }
 
     st.active = true;
     st.kv_c = kv_c;
@@ -11761,9 +11895,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_fa_compact_state fa_compact;
     if (ggml_vk_flash_attn_gather_compact(ctx, subctx, q, k, v, mask, dst, fa_compact)) {
         KV   = fa_compact.kv_c;
-        N    = 1; // one private compact segment per FA dispatch
+        N    = fa_compact.dynamic_kv ? (uint32_t) q->ne[1] : 1;
         nem0 = fa_compact.kv_c;
-        nem1 = 1;
+        nem1 = fa_compact.dynamic_kv ? (uint32_t) q->ne[1] : 1;
         nem2 = 1;
         nem3 = (uint32_t) q->ne[3];
     }
@@ -11899,7 +12033,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
+                                                                   fa_compact.dynamic_kv);
 
     vk_pipeline pipeline = nullptr;
 
@@ -11918,7 +12053,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // Compile early to initialize wg_denoms. Private compact batches issue one
     // FA dispatch (and descriptor set) per query.
     ggml_pipeline_request_descriptor_sets(ctx, pipeline,
-        fa_compact.active ? fa_compact.n_batch : 1);
+        fa_compact.active && !fa_compact.dynamic_kv ? fa_compact.n_batch : 1);
 
     uint32_t split_kv = KV;
     uint32_t split_k = 1;
@@ -12115,7 +12250,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : q_buf},
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
@@ -12129,7 +12264,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
-        if (fa_compact.active && fa_compact.n_batch > 1) {
+        if (fa_compact.active && !fa_compact.dynamic_kv && fa_compact.n_batch > 1) {
             auto offset_subbuffer = [](const vk_subbuffer & buf, size_t offset) {
                 GGML_ASSERT(offset <= buf.size);
                 return vk_subbuffer{buf.buffer, buf.offset + offset, buf.size - offset};
@@ -12138,16 +12273,16 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                 const vk_subbuffer q_query = offset_subbuffer(q_buf, (size_t) query * nbq1);
                 const vk_subbuffer k_query = offset_subbuffer(k_buf, (size_t) query * fa_compact.kc_query_stride);
                 const vk_subbuffer m_query = offset_subbuffer(mask_buf, (size_t) query * fa_compact.mc_query_stride);
-                // FA output is [HSV, heads, query, stream], so query is dst dim 2.
                 const vk_subbuffer d_query = offset_subbuffer(dst_buf, (size_t) query * nb2);
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                            {q_query, k_query, k_query, m_query, sinks_buf, d_query, mask_opt_buf},
-                                            pc, { workgroups_x, workgroups_y, workgroups_z });
+                    {q_query, k_query, k_query, m_query, sinks_buf, d_query, mask_opt_buf, q_query},
+                    pc, { workgroups_x, workgroups_y, workgroups_z });
             }
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
-                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+                {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf,
+                 fa_compact.dynamic_kv ? fa_compact.kv_buf : q_buf},
+                pc, { workgroups_x, workgroups_y, workgroups_z });
         }
     }
 }
