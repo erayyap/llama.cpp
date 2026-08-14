@@ -1055,6 +1055,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
     vk_pipeline pipeline_flash_attn_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_f16;
+    vk_pipeline pipeline_flash_attn_gather_union_dq_q8_0;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -1870,7 +1871,7 @@ struct vk_op_flash_attn_union_push_constants {
     uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
 };
 struct vk_op_flash_attn_gather_union_push_constants {
-    uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch;
+    uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch, row_elems;
 };
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_batch, n_kv_raw, n_top_k, kv_c;
@@ -6286,6 +6287,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_f16,
                 "flash_attn_gather_union_f16", flash_attn_gather_union_f16_len, flash_attn_gather_union_f16_data, "main", 6,
+                sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
+                device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_dq_q8_0,
+                "flash_attn_gather_union_dq_q8_0", flash_attn_gather_union_dq_q8_0_len, flash_attn_gather_union_dq_q8_0_data, "main", 6,
                 sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
                 device->subgroup_size);
         }
@@ -11782,7 +11787,9 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     const bool     bitmap_fits = (uint64_t) ((k->ne[1] - n_kv_raw) + 31) / 32 <= max_words;
 
     static const char * union_env = getenv("GGML_VK_FA_TOPK_UNION");
-    if ((!union_env || union_env[0] != '0') && gather_f16 && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
+    const bool gather_union_q8 = gather_q8 && ctx->device->pipeline_flash_attn_gather_union_dq_q8_0;
+    if ((!union_env || union_env[0] != '0') && (gather_f16 || gather_union_q8) &&
+        q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
         ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
         ggml_vk_fa_union_stat_init(ctx)) {
         const uint32_t max_union = n_cand;
@@ -11849,8 +11856,11 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             goto union_unavailable;
         }
 
-        const size_t   ukc_sz = (size_t) kv_union_c * 512 * sizeof(ggml_fp16_t);
-        const size_t   umc_sz = (size_t) n_batch * kv_union_c * sizeof(ggml_fp16_t);
+        // Both f16 and q8 decoded gathers produce a contiguous f16 compact cache.
+        const bool dq = k->type == GGML_TYPE_Q8_0 &&
+                        ctx->device->pipeline_flash_attn_gather_union_dq_q8_0;
+        const size_t ukc_sz = (size_t) kv_union_c * 512 * sizeof(ggml_fp16_t);
+        const size_t umc_sz = (size_t) n_batch * kv_union_c * sizeof(ggml_fp16_t);
         const size_t   ul_sz  = (size_t) max_union * sizeof(uint32_t);
         const size_t   need   = ukc_sz + umc_sz + ul_sz;
         if (ctx->prealloc_size_y < need) {
@@ -11869,8 +11879,10 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         // prealloc_y sync above is a global barrier and orders the previous layer's read.
         const vk_subbuffer uc_buf = ggml_vk_subbuffer(ctx, ctx->fa_union_stat);
 
+        vk_pipeline gather_pipe = dq ? ctx->device->pipeline_flash_attn_gather_union_dq_q8_0
+                                     : ctx->device->pipeline_flash_attn_gather_union_f16;
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, 1);
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_gather_union_f16, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, gather_pipe, 1);
 
         const vk_op_flash_attn_union_push_constants upc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, n_batch, (uint32_t) top_k->ne[0], max_union,
@@ -11880,13 +11892,15 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             { ggml_vk_tensor_subbuffer(ctx, top_k), ul_buf, uc_buf }, upc, { 1, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
 
+        // The q8 decoder steps K in blocks; the f16 gather steps in f16 elements.
         const vk_op_flash_attn_gather_union_push_constants gpc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, kv_union_c,
-            (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
+            dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type))
+               : (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
             (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
-            n_batch,
+            n_batch, (uint32_t) k->ne[0],
         };
-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
+        ggml_vk_dispatch_pipeline(ctx, subctx, gather_pipe,
             { ggml_vk_tensor_subbuffer(ctx, k), ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
               kc_buf, mc_buf, uc_buf }, gpc, { kv_union_c, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);

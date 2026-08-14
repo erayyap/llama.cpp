@@ -10040,6 +10040,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, GGML_TYPE_F16, 1, 60));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, GGML_TYPE_F16, 1, 86));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(35584,  8, 2304, 512, false, GGML_TYPE_F16, 1, 60));
+    // Duplicate batch shapes seed the estimator, then exercise the actual q8 decoded union.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  4, 2304, 512, false, GGML_TYPE_Q8_0, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  4, 2304, 512, true,  GGML_TYPE_Q8_0, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(35584,  5, 2304, 512, false, GGML_TYPE_Q8_0, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(35584,  5, 2304, 512, true,  GGML_TYPE_Q8_0, 1, 60));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, GGML_TYPE_F16, 2));
     // Quantized sparse-prefill caches are dequantized once into f16 scratch.
     for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
