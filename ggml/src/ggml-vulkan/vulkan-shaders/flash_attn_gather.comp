@@ -4,6 +4,10 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
+#if defined(DATA_A_Q8_0)
+#include "types.glsl"
+#endif
+
 // Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA decode) into a
 // compact contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), then the
 // n_top_k selected rows, then zero padding up to kv_c. The gathered mask row keeps the
@@ -13,7 +17,11 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+#if defined(DATA_A_Q8_0)
+layout(binding = 0) readonly  buffer KBuf   { block_q8_0 data_k[];  };
+#else
 layout(binding = 0) readonly  buffer KBuf   { float16_t data_k[];   };
+#endif
 layout(binding = 1) readonly  buffer TopBuf { int       data_top[]; };
 layout(binding = 2) readonly  buffer MBuf   { float16_t data_m[];   };
 layout(binding = 3) writeonly buffer KcBuf  { float16_t data_kc[];  };
@@ -24,8 +32,8 @@ layout(push_constant) uniform Parameters {
     uint n_kv_raw; // dense prefix length
     uint n_top_k;  // selected rows for the (single) query token
     uint kv_c;     // padded compact row count == dispatch row range
-    uint nbk1;     // K source row stride, elements
-    uint nbk3;     // K source stream stride, elements
+    uint nbk1;     // K source row stride, storage units (f16 elements or q8_0 blocks)
+    uint nbk3;     // K source stream stride, storage units
     uint nbt3;     // top_k stream stride, elements
     uint nbm3;     // mask source stream stride, elements
     uint nem3;     // mask ne[3], for stream broadcast
@@ -53,9 +61,21 @@ void main() {
     const uint dst_base = (stream * p.kv_c + row) * HEAD_SIZE;
     if (src < p.n_kv) {
         const uint src_base = stream * p.nbk3 + src * p.nbk1;
+#if defined(DATA_A_Q8_0)
+        // A 512-wide q8_0 row is 16 blocks. Four lanes cooperatively expand each
+        // 32-value block, keeping source reads and f16 scratch writes contiguous.
+        const uint block = tid / 4;
+        const uint q_base = (tid % 4) * 8;
+        const float d = float(data_k[src_base + block].d);
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            data_kc[dst_base + block * 32 + q_base + i] =
+                float16_t(d * float(data_k[src_base + block].qs[q_base + i]));
+        }
+#else
         [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
             data_kc[dst_base + tid + i * LANES] = data_k[src_base + tid + i * LANES];
         }
+#endif
         if (tid == 0) {
             data_mc[stream * p.kv_c + row] = data_m[(stream % p.nem3) * p.nbm3 + src];
         }

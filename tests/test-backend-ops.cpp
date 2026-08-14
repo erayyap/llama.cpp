@@ -6948,12 +6948,13 @@ struct test_flash_attn_ext_top_k : public test_case {
     const int64_t n_kv_raw; // dense prefix always attended
     const int64_t n_top_k;  // selected keys per query token
     const bool    sinks;
+    const ggml_type type_K; // cache storage; q8_0 exercises decode gather+dequant
 
     static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
     static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
 
     std::string vars() override {
-        return VARS_TO_STR5(kv, nb, n_kv_raw, n_top_k, sinks);
+        return VARS_TO_STR6(kv, nb, n_kv_raw, n_top_k, sinks, type_K);
     }
 
     double max_nmse_err() override {
@@ -6967,14 +6968,15 @@ struct test_flash_attn_ext_top_k : public test_case {
         return 2 * nh * nb * (hs + hs) * (n_kv_raw + n_top_k);
     }
 
-    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false)
-        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks) {}
+    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128,
+            bool sinks = false, ggml_type type_K = GGML_TYPE_F16)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), type_K(type_K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, 1, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, 1);
         ggml_set_name(k, "k");
 
         // V4 CSA attends over the K latent itself: V is the same cache tensor
@@ -9900,6 +9902,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // and the kv=512 case verify dense-fallback parity with the hint attached, the
     // nb=64/128 cases exercise the sparse shader itself.
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  1, 1024, 512, true, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
@@ -10341,6 +10345,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int nb : { 1, 8, 64, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false));
         }
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1, 1024, 512, false, GGML_TYPE_Q8_0));
     }
 
     return test_cases;

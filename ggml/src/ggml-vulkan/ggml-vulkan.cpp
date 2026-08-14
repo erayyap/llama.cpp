@@ -1041,6 +1041,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
+    vk_pipeline pipeline_flash_attn_gather_q8_0;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -6141,6 +6142,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_f16,
             "flash_attn_gather_f16", flash_attn_gather_f16_len, flash_attn_gather_f16_data, "main", 5,
+            sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
+            device->subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_q8_0,
+            "flash_attn_gather_q8_0", flash_attn_gather_q8_0_len, flash_attn_gather_q8_0_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
             device->subgroup_size);
     }
@@ -11270,10 +11275,14 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         const ggml_tensor * mask, ggml_tensor * dst, vk_fa_compact_state & st) {
     const ggml_tensor * top_k = dst->src[5];
     static const char * gather_env = getenv("GGML_VK_FA_TOPK_GATHER");
+    const bool gather_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                            ctx->device->pipeline_flash_attn_gather_f16;
+    const bool gather_q8  = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+                            ctx->device->pipeline_flash_attn_gather_q8_0;
     if ((gather_env && gather_env[0] == '0') ||
-        !top_k || !ctx->device->pipeline_flash_attn_gather_f16 ||
+        !top_k || (!gather_f16 && !gather_q8) ||
         q->ne[1] != 1 ||    // single-token decode only; batched queries need a union gather
-        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        q->type != GGML_TYPE_F32 ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 || q->ne[2] != 64 ||
         k->ne[2] != 1 || v->ne[2] != 1 ||
@@ -11315,13 +11324,15 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_gather_f16;
+    vk_pipeline pipeline = gather_q8 ? ctx->device->pipeline_flash_attn_gather_q8_0
+                                     : ctx->device->pipeline_flash_attn_gather_f16;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
+    const size_t k_storage_size = ggml_type_size(k->type);
     const vk_op_flash_attn_gather_push_constants pc = {
         (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
-        (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
-        (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (k->nb[1] / k_storage_size),
+        (uint32_t) (k->nb[3] / k_storage_size),
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) mask->ne[3],
@@ -11459,8 +11470,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // If this fires, supports_op admitted a non-native K/V type the gate then rejected; the
     // native shader would return garbage rather than fail, so abort instead.
     GGML_ASSERT(use_dequant_kv || !kv_needs_dequant);
-    const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
-    const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
+    const ggml_type k_type_eff = (use_dequant_kv || fa_compact.active) ? GGML_TYPE_F16 : k->type;
+    const ggml_type v_type_eff = (use_dequant_kv || fa_compact.active) ? GGML_TYPE_F16 : v->type;
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
