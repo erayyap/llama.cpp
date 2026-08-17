@@ -3019,8 +3019,8 @@ private:
                         n_ctx_max > 0 && slot.prompt.n_tokens() >= n_ctx_max && slot.spec_draft.empty();
                     common_speculative_set_enabled(spec.get(), slot.id, !slot.spec_adaptive_raw);
 
-                    if (!slot.spec_draft.empty()) {
-                        // we have a previous (partial) draft to reuse
+                    if (slot.spec_is_replay || !slot.spec_draft.empty()) {
+                        // we have a previous (partial) draft to reuse, or a zero-accept replay
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
@@ -3847,6 +3847,12 @@ private:
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
+            if (slot.spec_is_replay) {
+                common_speculative_accept(spec.get(), slot.id, 0);
+                slot.n_draft_verif_steps += 1;
+                slot.spec_is_replay = false;
+            }
+
             slot.n_decoded += 1;
             slot.spec_adaptive_raw = false;
 
@@ -3930,9 +3936,10 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        // Replay only accepted draft tokens. Sample the target replacement again after replay.
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_draft.pop_back();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -3966,10 +3973,7 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
-            size_t n_accepted = ids.size() - 1;
-            if (slot.spec_is_replay && n_accepted > 0) {
-                n_accepted--;
-            }
+            const size_t n_accepted = ids.size() - 1;
             slot.spec_is_replay = false;
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
