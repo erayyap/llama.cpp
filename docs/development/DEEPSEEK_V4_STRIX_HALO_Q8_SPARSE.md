@@ -265,6 +265,6 @@ The fork-specific sequence is:
 - `2ba5970d` — batched speculative gathering;
 - `05b82c24` — query-private sparse verification segments;
 - `7c3b67b3` — shape-gated four-row q8_0 decode projection;
-- cooperative-matrix lightning-indexer batches — opt-in long-context speculative verification acceleration.
+- `28633d8c` — opt-in cooperative-matrix lightning-indexer batches for long-context speculative verification.
 
 The untouched non-sparse adaptive runtime remains a straightforward rollback target, and `GGML_VK_FA_TOPK_GATHER=0` provides a same-binary control.
