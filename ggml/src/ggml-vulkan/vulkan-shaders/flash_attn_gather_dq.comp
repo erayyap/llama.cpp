@@ -1,0 +1,93 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#define FLOAT_TYPE float
+#include "types.glsl"
+
+// Nathan's per-token decoded gather, adapted to the local query-private compact layout.
+// Each query gets its own raw-prefix + selected-key segment, while quantized rows are
+// expanded once into f16 scratch instead of being decoded repeatedly inside flash attention.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A      { A_TYPE    data_a[];   };
+layout(binding = 1) readonly  buffer TopBuf { int       data_top[]; };
+layout(binding = 2) readonly  buffer MBuf   { float16_t data_m[];   };
+layout(binding = 3) writeonly buffer KcBuf  { float16_t data_kc[];  };
+layout(binding = 4) writeonly buffer McBuf  { float16_t data_mc[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_batch;
+    uint n_kv_raw;
+    uint n_top_k;
+    uint kv_c;
+    uint nbk1;      // K source row stride, quantization blocks
+    uint nbk3;      // K source stream stride, quantization blocks
+    uint nbt1;
+    uint nbt3;
+    uint nbm1;
+    uint nbm3;
+    uint n_streams;
+    uint nem3;
+} p;
+
+const uint HEAD_SIZE = 512;
+
+void main() {
+    const uint row          = gl_WorkGroupID.x;
+    const uint query_stream = gl_WorkGroupID.z;
+    const uint query        = query_stream / p.n_streams;
+    const uint stream       = query_stream - query * p.n_streams;
+    const uint tid          = gl_LocalInvocationIndex;
+
+    uint src = p.n_kv;
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else if (row < p.n_kv_raw + p.n_top_k) {
+        const uint slot = row - p.n_kv_raw;
+        const int idx = data_top[stream * p.nbt3 + query * p.nbt1 + slot];
+        if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
+            src = p.n_kv_raw + uint(idx);
+        }
+    }
+
+    const uint dst_base = (query_stream * p.kv_c + row) * HEAD_SIZE;
+    const uint e0 = tid * 8;
+    if (src < p.n_kv) {
+        const uint ib  = stream * p.nbk3 + src * p.nbk1 + e0 / QUANT_K;
+        const uint iqs = e0 % QUANT_K;
+        const float d  = float(data_a[ib].d);
+#if defined(DATA_A_Q8_0)
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_kc[dst_base + e0 + l] = float16_t(d * float(data_a[ib].qs[iqs + l]));
+        }
+#elif defined(DATA_A_Q4_0)
+        const uint shift = (iqs >> 4) * 4;
+        const uint byte0 = iqs & 0xF;
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            const float q = float((data_a[ib].qs[byte0 + l] >> shift) & 0xF) - 8.0f;
+            data_kc[dst_base + e0 + l] = float16_t(d * q);
+        }
+#else
+#error "no element mapping written for this K type"
+#endif
+    } else {
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_kc[dst_base + e0 + l] = float16_t(0.0);
+        }
+    }
+
+    if (tid == 0) {
+        float16_t value = float16_t(uintBitsToFloat(0xff800000));
+        if (src < p.n_kv) {
+            value = data_m[(stream % p.nem3) * p.nbm3 + query * p.nbm1 + src];
+        }
+        data_mc[query_stream * p.kv_c + row] = value;
+    }
+}

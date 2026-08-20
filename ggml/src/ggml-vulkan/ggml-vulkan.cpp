@@ -1051,6 +1051,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_q8_0;
+    vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -6250,6 +6251,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "flash_attn_gather_q8_0", flash_attn_gather_q8_0_len, flash_attn_gather_q8_0_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
             device->subgroup_size);
+#define CREATE_FA_GATHER_TOK_DQ(TYPE, NAMED) \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_dq[TYPE], \
+            "flash_attn_gather_dq_" #NAMED, flash_attn_gather_dq_ ## NAMED ## _len, \
+            flash_attn_gather_dq_ ## NAMED ## _data, "main", 5, \
+            sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true, \
+            device->subgroup_size);
+        CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q4_0, q4_0)
+        CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q8_0, q8_0)
+#undef CREATE_FA_GATHER_TOK_DQ
     }
 
     // DSv4 fused hyper-connection ops: plain f32 compute, no subgroup/coopmat requirements
@@ -11596,12 +11606,18 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         const ggml_tensor * mask, ggml_tensor * dst, vk_fa_compact_state & st) {
     const ggml_tensor * top_k = dst->src[5];
     static const char * gather_env = getenv("GGML_VK_FA_TOPK_GATHER");
+    static const char * gather_dq_env = getenv("GGML_VK_FA_GATHER_DQ");
     const bool gather_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                             ctx->device->pipeline_flash_attn_gather_f16;
     const bool gather_q8  = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
                             ctx->device->pipeline_flash_attn_gather_q8_0;
+    // The local q8 decoded gather is already essentially tied with Nathan's mapping.
+    // Keep the port opt-in for controlled comparisons and for q4_0 cache experiments.
+    const bool gather_dq = k->type == v->type && ggml_is_quantized(k->type) &&
+                           gather_dq_env && gather_dq_env[0] == '1' &&
+                           ctx->device->pipeline_flash_attn_gather_dq[k->type];
     if ((gather_env && gather_env[0] == '0') ||
-        !top_k || (!gather_f16 && !gather_q8) ||
+        !top_k || (!gather_f16 && !gather_q8 && !gather_dq) ||
         q->ne[1] < 1 || q->ne[1] > 8 || // decode/speculative verification only
         q->type != GGML_TYPE_F32 ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
@@ -11649,8 +11665,10 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_pipeline pipeline = gather_q8 ? ctx->device->pipeline_flash_attn_gather_q8_0
-                                     : ctx->device->pipeline_flash_attn_gather_f16;
+    const bool use_dq = gather_dq;
+    vk_pipeline pipeline = use_dq ? ctx->device->pipeline_flash_attn_gather_dq[k->type]
+                                  : (gather_q8 ? ctx->device->pipeline_flash_attn_gather_q8_0
+                                               : ctx->device->pipeline_flash_attn_gather_f16);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const size_t k_storage_size = ggml_type_size(k->type);
