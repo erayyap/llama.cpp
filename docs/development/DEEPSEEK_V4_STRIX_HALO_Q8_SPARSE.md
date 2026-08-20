@@ -295,6 +295,6 @@ The fork-specific sequence is:
 - `05b82c24` — query-private sparse verification segments;
 - `7c3b67b3` — shape-gated four-row q8_0 decode projection;
 - `28633d8c` — opt-in cooperative-matrix lightning-indexer batches for long-context speculative verification;
-- experimental q8_0 indexer-cache and block-local indexer/top-k fusion — retained opt-in, not production-promoted.
+- `0283af58` — experimental q8_0 indexer-cache and block-local indexer/top-k fusion, retained opt-in and not production-promoted.
 
 The untouched non-sparse adaptive runtime remains a straightforward rollback target, and `GGML_VK_FA_TOPK_GATHER=0` provides a same-binary control.
