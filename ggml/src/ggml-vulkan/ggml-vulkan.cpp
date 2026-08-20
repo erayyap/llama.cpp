@@ -884,6 +884,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_rows4_f32[mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
@@ -4197,6 +4198,14 @@ static bool ggml_vk_mmid_f16b_enabled() {
     return enabled;
 }
 
+static bool ggml_vk_q8_dmmv_rows4_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_Q8_DMMV_ROWS4");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -5586,6 +5595,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_M], "mul_mat_vec_id_iq1_m_q8_1_f32", arr_dmmv_id_iq1_m_q8_1_f32_len[reduc], arr_dmmv_id_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
         }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+    }
+
+    // DeepSeek V4's 32768x1024 q8_0 decode projection benefits from reusing
+    // each activation vector across four output rows. Keep this separate from
+    // the generic row-count heuristic so unrelated shapes remain unchanged.
+    for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_0_rows4_f32[i],
+            "mul_mat_vec_q8_0_rows4_f32_f32", arr_dmmv_q8_0_f32_f32_len[SHADER_REDUCTION_MODE_SUBGROUP],
+            arr_dmmv_q8_0_f32_f32_data[SHADER_REDUCTION_MODE_SUBGROUP], "main", mul_mat_vec_num_bindings,
+            sizeof(vk_mat_vec_push_constants), {4, 1, 1}, {subgroup_size, 4, i + 1}, 1, true,
+            use_subgroups, force_subgroup_size);
     }
 
 #undef OCP_DMMV_DATA
@@ -8086,6 +8106,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+    }
+
+    if (ggml_vk_q8_dmmv_rows4_enabled() && a_type == GGML_TYPE_Q8_0 && b_type == GGML_TYPE_F32 &&
+        num_cols == 1 && m == 32768 && k == 1024) {
+        return ctx->device->pipeline_dequant_mul_mat_vec_q8_0_rows4_f32[0];
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
