@@ -1837,7 +1837,7 @@ static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_batch, n_kv_raw, n_top_k, kv_c;
-    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3;
+    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, n_streams, nem3;
 };
 static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
 
@@ -11260,14 +11260,17 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 struct vk_fa_compact_state {
     bool active = false;
     uint32_t kv_c = 0;
+    uint32_t n_batch = 0;
+    size_t kc_query_stride = 0;
+    size_t mc_query_stride = 0;
     vk_subbuffer kc_buf, mc_buf;
 };
 
 // V4 sparse decode (gather-to-compact): the sparse prefill shader above gates on
 // q->ne[1] >= 64, so decode and small speculative batches otherwise attend densely
-// over the whole compressed KV. Gather the raw prefix plus one top-k segment per query
-// into a compact shared K scratch, and build a compact per-query mask that exposes only
-// that query's segment. The ordinary dense FA then runs over the compact K/V/mask.
+// over the whole compressed KV. Gather a private raw-prefix + top-k segment for each
+// query. The ordinary dense FA then runs once per query over only that compact segment,
+// avoiding the quadratic masked rectangle formed by concatenating every query's top-k.
 // This preserves the source mask's exact causal and sparse-selection semantics.
 static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
@@ -11306,16 +11309,18 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     }
 
     const uint32_t n_batch = (uint32_t) q->ne[1];
-    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + n_batch * top_k->ne[0]), 256u);
-    // The compact K contains one selected segment per query. Compaction only pays
-    // when the full source is comfortably larger than that concatenated active set.
+    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + top_k->ne[0]), 256u);
+    // Each FA dispatch sees only one query's active set. Require the full source to
+    // be comfortably larger than that set; gather cost is handled separately below.
     if ((uint64_t) k->ne[1] < 2ull * kv_c) {
         return false;
     }
 
-    const uint32_t ns    = (uint32_t) q->ne[3];
-    const size_t   kc_sz = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
-    const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
+    const uint32_t ns = (uint32_t) q->ne[3];
+    const size_t kc_query_stride = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
+    const size_t mc_query_stride = (size_t) ns * kv_c * sizeof(ggml_fp16_t);
+    const size_t kc_sz = (size_t) n_batch * kc_query_stride;
+    const size_t mc_sz = (size_t) n_batch * mc_query_stride;
 
     if (ctx->prealloc_size_y < kc_sz + mc_sz) {
         ctx->prealloc_size_y = kc_sz + mc_sz;
@@ -11338,6 +11343,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
         (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
+        ns,
         (uint32_t) mask->ne[3],
     };
 
@@ -11346,12 +11352,15 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, top_k),
           ggml_vk_tensor_subbuffer(ctx, mask), st.kc_buf, st.mc_buf },
-        pc, { kv_c, 1, ns });
+        pc, { kv_c, 1, ns * n_batch });
     ggml_vk_sync_buffers(ctx, subctx);
     ctx->prealloc_y_need_sync = true;
 
     st.active = true;
     st.kv_c = kv_c;
+    st.n_batch = n_batch;
+    st.kc_query_stride = kc_query_stride;
+    st.mc_query_stride = mc_query_stride;
     return true;
 }
 
@@ -11415,14 +11424,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_fa_compact_state fa_compact;
     if (ggml_vk_flash_attn_gather_compact(ctx, subctx, q, k, v, mask, dst, fa_compact)) {
         KV   = fa_compact.kv_c;
+        N    = 1; // one private compact segment per FA dispatch
         nem0 = fa_compact.kv_c;
-        nem1 = N;
+        nem1 = 1;
         nem2 = 1;
         nem3 = (uint32_t) q->ne[3];
     }
     uint32_t gqa_ratio = 1;
     uint32_t qk_ratio = neq2 / nek2;
-    uint32_t workgroups_x = (uint32_t)neq1;
+    uint32_t workgroups_x = N;
     uint32_t workgroups_y = (uint32_t)neq2;
     uint32_t workgroups_z = (uint32_t)neq3;
 
@@ -11568,8 +11578,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     assert(pipeline);
-    // Compile early to initialize wg_denoms.
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    // Compile early to initialize wg_denoms. Private compact batches issue one
+    // FA dispatch (and descriptor set) per query.
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline,
+        fa_compact.active ? fa_compact.n_batch : 1);
 
     uint32_t split_kv = KV;
     uint32_t split_k = 1;
@@ -11601,6 +11613,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
+    }
+    // Private compact segments are dispatched one query at a time. Their 64 head
+    // workgroups already fill the GPU, and disabling split-K keeps each dispatch's
+    // temporary/output addressing independent.
+    if (fa_compact.active && fa_compact.n_batch > 1) {
+        split_kv = KV;
+        split_k = 1;
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -11773,9 +11792,26 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+        if (fa_compact.active && fa_compact.n_batch > 1) {
+            auto offset_subbuffer = [](const vk_subbuffer & buf, size_t offset) {
+                GGML_ASSERT(offset <= buf.size);
+                return vk_subbuffer{buf.buffer, buf.offset + offset, buf.size - offset};
+            };
+            for (uint32_t query = 0; query < fa_compact.n_batch; ++query) {
+                const vk_subbuffer q_query = offset_subbuffer(q_buf, (size_t) query * nbq1);
+                const vk_subbuffer k_query = offset_subbuffer(k_buf, (size_t) query * fa_compact.kc_query_stride);
+                const vk_subbuffer m_query = offset_subbuffer(mask_buf, (size_t) query * fa_compact.mc_query_stride);
+                // FA output is [HSV, heads, query, stream], so query is dst dim 2.
+                const vk_subbuffer d_query = offset_subbuffer(dst_buf, (size_t) query * nb2);
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                            {q_query, k_query, k_query, m_query, sinks_buf, d_query, mask_opt_buf},
+                                            pc, { workgroups_x, workgroups_y, workgroups_z });
+            }
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
+                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+        }
     }
 }
 

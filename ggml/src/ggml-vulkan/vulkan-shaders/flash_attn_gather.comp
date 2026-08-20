@@ -8,14 +8,14 @@
 #include "types.glsl"
 #endif
 
-// Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA decode) into a
-// compact contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), followed
-// by one n_top_k segment for each query token, then zero padding up to kv_c. Each query's
-// compact mask exposes the raw prefix and only its own selected segment. This deliberately
-// keeps duplicate selections across queries: it avoids a GPU union/hash pass and is small for
-// speculative batches (<= 8), while still removing the full-context scan. Invalid top-k
-// indices and padding get -inf masks and zeroed K. V is the K latent (V==K), so one gather
-// serves both.
+// Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA decode) into one
+// private compact K/mask segment per query: rows [0, n_kv_raw), followed by that query's
+// n_top_k selections, then zero padding up to kv_c. Keeping each segment independent lets the
+// host run N single-query flash-attention dispatches over n_kv_raw+n_top_k rows instead of one
+// batched dispatch over n_kv_raw+N*n_top_k rows with cross-query masks. The raw prefix is
+// duplicated for these tiny speculative batches (<= 8), trading extra gather bandwidth for a
+// much smaller attention rectangle. Invalid top-k indices and padding get -inf masks and
+// zeroed K. V is the K latent (V==K), so one gather serves both.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -31,7 +31,7 @@ layout(binding = 4) writeonly buffer McBuf  { float16_t data_mc[];  };
 
 layout(push_constant) uniform Parameters {
     uint n_kv;     // total source KV rows
-    uint n_batch;  // query tokens sharing this compact K scratch
+    uint n_batch;  // number of private query segments
     uint n_kv_raw; // dense prefix length
     uint n_top_k;  // selected rows per query token
     uint kv_c;     // padded compact row count == dispatch row range
@@ -41,6 +41,7 @@ layout(push_constant) uniform Parameters {
     uint nbt3;     // top_k stream stride, elements
     uint nbm1;     // mask query stride, elements
     uint nbm3;     // mask source stream stride, elements
+    uint n_streams;// query/K stream count
     uint nem3;     // mask ne[3], for stream broadcast
 } p;
 
@@ -48,27 +49,24 @@ const uint HEAD_SIZE = 512;
 const uint LANES = 64;
 
 void main() {
-    const uint row    = gl_WorkGroupID.x;
-    const uint stream = gl_WorkGroupID.z;
-    const uint tid    = gl_LocalInvocationIndex;
+    const uint row          = gl_WorkGroupID.x;
+    const uint query_stream = gl_WorkGroupID.z;
+    const uint query        = query_stream / p.n_streams;
+    const uint stream       = query_stream - query * p.n_streams;
+    const uint tid          = gl_LocalInvocationIndex;
 
-    // Map compact row -> source row. `owner == n_batch` denotes the shared raw
-    // prefix; p.n_kv is the invalid source sentinel for padding/bad indices.
     uint src = p.n_kv;
-    uint owner = p.n_batch;
     if (row < p.n_kv_raw) {
         src = row;
-    } else if (row < p.n_kv_raw + p.n_batch * p.n_top_k) {
-        const uint selected = row - p.n_kv_raw;
-        owner = selected / p.n_top_k;
-        const uint top_pos = selected - owner * p.n_top_k;
-        const int idx = data_top[stream * p.nbt3 + owner * p.nbt1 + top_pos];
+    } else if (row < p.n_kv_raw + p.n_top_k) {
+        const uint top_pos = row - p.n_kv_raw;
+        const int idx = data_top[stream * p.nbt3 + query * p.nbt1 + top_pos];
         if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
             src = p.n_kv_raw + uint(idx);
         }
     }
 
-    const uint dst_base = (stream * p.kv_c + row) * HEAD_SIZE;
+    const uint dst_base = (query_stream * p.kv_c + row) * HEAD_SIZE;
     if (src < p.n_kv) {
         const uint src_base = stream * p.nbk3 + src * p.nbk1;
 #if defined(DATA_A_Q8_0)
@@ -92,15 +90,11 @@ void main() {
         }
     }
 
-    // The compact K is shared by every query, but selected segments are private.
-    // Copy the original mask for the raw prefix and the owning query's segment;
-    // all cross-query segments, invalid indices, and padding remain masked.
-    if (tid < p.n_batch) {
-        const uint query = tid;
+    if (tid == 0) {
         float16_t value = float16_t(uintBitsToFloat(0xff800000));
-        if (src < p.n_kv && (owner == p.n_batch || owner == query)) {
+        if (src < p.n_kv) {
             value = data_m[(stream % p.nem3) * p.nbm3 + query * p.nbm1 + src];
         }
-        data_mc[(stream * p.n_batch + query) * p.kv_c + row] = value;
+        data_mc[query_stream * p.kv_c + row] = value;
     }
 }

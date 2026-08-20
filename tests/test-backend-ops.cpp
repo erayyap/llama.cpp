@@ -6949,12 +6949,13 @@ struct test_flash_attn_ext_top_k : public test_case {
     const int64_t n_top_k;  // selected keys per query token
     const bool    sinks;
     const ggml_type type_K; // cache storage; q8_0 exercises decode gather+dequant
+    const int64_t ns;       // independent sequence/stream count
 
     static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
     static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
 
     std::string vars() override {
-        return VARS_TO_STR6(kv, nb, n_kv_raw, n_top_k, sinks, type_K);
+        return VARS_TO_STR7(kv, nb, n_kv_raw, n_top_k, sinks, type_K, ns);
     }
 
     double max_nmse_err() override {
@@ -6965,28 +6966,28 @@ struct test_flash_attn_ext_top_k : public test_case {
         GGML_UNUSED(t);
         // only the active keys contribute compute on a sparse backend; count those so
         // perf mode reports the useful-work rate
-        return 2 * nh * nb * (hs + hs) * (n_kv_raw + n_top_k);
+        return 2 * nh * nb * ns * (hs + hs) * (n_kv_raw + n_top_k);
     }
 
     test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128,
-            bool sinks = false, ggml_type type_K = GGML_TYPE_F16)
-        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), type_K(type_K) {}
+            bool sinks = false, ggml_type type_K = GGML_TYPE_F16, int64_t ns = 1)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), type_K(type_K), ns(ns) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, ns);
         ggml_set_name(k, "k");
 
         // V4 CSA attends over the K latent itself: V is the same cache tensor
-        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, 1, k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, ns, k->nb[1], k->nb[2], k->nb[3], 0);
         ggml_set_name(v, "v");
 
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
         ggml_set_name(m, "m");
 
-        ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, 1);
+        ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, ns);
         ggml_set_name(t, "top_k");
 
         ggml_tensor * s = nullptr;
@@ -7021,23 +7022,27 @@ struct test_flash_attn_ext_top_k : public test_case {
         // build a consistent (top_k, mask) pair: a deterministic per-token selection,
         // strided so adjacent tokens select overlapping-but-different keys, with one
         // deliberately invalid index (-1) whose mask slot stays -inf
-        std::vector<int32_t> top(n_top_k * nb);
-        std::vector<ggml_fp16_t> mask(kv * nb);
+        std::vector<int32_t> top(n_top_k * nb * ns);
+        std::vector<ggml_fp16_t> mask(kv * nb * ns);
         const ggml_fp16_t minus_inf = ggml_fp32_to_fp16(-INFINITY);
         const ggml_fp16_t zero      = ggml_fp32_to_fp16(0.0f);
 
-        for (int64_t b = 0; b < nb; ++b) {
-            for (int64_t i = 0; i < kv; ++i) {
-                mask[b * kv + i] = i < n_kv_raw ? zero : minus_inf;
-            }
-            for (int64_t j = 0; j < n_top_k; ++j) {
-                int32_t idx = (int32_t) ((j * range) / n_top_k + b) % (int32_t) range;
-                if (j == n_top_k - 1 && b == 0) {
-                    idx = -1; // exercise the ignore-invalid-index path
-                } else {
-                    mask[b * kv + n_kv_raw + idx] = zero;
+        for (int64_t sidx = 0; sidx < ns; ++sidx) {
+            for (int64_t b = 0; b < nb; ++b) {
+                const int64_t mask_base = (sidx * nb + b) * kv;
+                const int64_t top_base = (sidx * nb + b) * n_top_k;
+                for (int64_t i = 0; i < kv; ++i) {
+                    mask[mask_base + i] = i < n_kv_raw ? zero : minus_inf;
                 }
-                top[b * n_top_k + j] = idx;
+                for (int64_t j = 0; j < n_top_k; ++j) {
+                    int32_t idx = (int32_t) ((j * range) / n_top_k + b + sidx) % (int32_t) range;
+                    if (j == n_top_k - 1 && b == 0 && sidx == 0) {
+                        idx = -1; // exercise the ignore-invalid-index path
+                    } else {
+                        mask[mask_base + n_kv_raw + idx] = zero;
+                    }
+                    top[top_base + j] = idx;
+                }
             }
         }
 
@@ -9905,7 +9910,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  1, 1024, 512, true, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  2, 1024, 512, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  3, 1024, 512, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  5, 1024, 512, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  6, 1024, 512, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  5, 1024, 512, true, GGML_TYPE_Q8_0, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
