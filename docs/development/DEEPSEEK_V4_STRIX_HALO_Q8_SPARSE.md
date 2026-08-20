@@ -65,6 +65,14 @@ The retained query-private layout instead gathers one independently padded `raw 
 
 The path supports batches 1 through 8 and engages when the complete source cache is at least twice one padded private active set. Otherwise it keeps the existing dense path.
 
+### q8_0 decode projection row coarsening
+
+A bounded non-speculative Vulkan profile found ordinary q8_0 matrix-vector projections consuming about 29.5 ms, or 48.5% of the measured 60.9 ms single-token GPU graph. The `m=32768, n=1, k=1024` projection was the strongest isolated row-reuse candidate.
+
+`GGML_VK_Q8_DMMV_ROWS4=1` enables a shape-gated pipeline that computes four output rows per workgroup only for that exact q8_0/f32 projection. Other dimensions, types, and generic matvec heuristics are unchanged. Setting the variable to `0` or leaving it unset is the same-binary rollback control.
+
+Global row coarsening, forced integer-dot MMVQ, wave32, and 256-thread decode-vector workgroups were screened and rejected because they were mixed or slower at full-model level.
+
 ## Build
 
 ```bash
@@ -84,6 +92,7 @@ Replace model paths with compatible GGUF files:
 ```bash
 LLAMA_DSPARK_ADAPTIVE=1 \
 GGML_VK_FA_TOPK_GATHER=1 \
+GGML_VK_Q8_DMMV_ROWS4=1 \
 ./build-vulkan/bin/llama-server \
   -m /path/to/deepseek-v4-flash.gguf \
   -md /path/to/dspark-q8_0.gguf \
@@ -118,6 +127,16 @@ A targeted example:
 ```
 
 The focused q8 cases passed against the CPU reference. A broader Vulkan q8 flash-attention filter passed 1328/1328 cases in the development worktree.
+
+The decode-projection case can be checked separately:
+
+```bash
+GGML_VK_Q8_DMMV_ROWS4=1 ./build-vulkan/bin/test-backend-ops test \
+  -b Vulkan0 -o MUL_MAT \
+  -p 'type_a=q8_0,type_b=f32,m=32768,n=1,k=1024.*'
+```
+
+This passed against the CPU reference, and the fixed DSpark quality gate retained 10/10 semantic passes and 10/10 exact reference SHA-256 hashes.
 
 ## Performance
 
@@ -165,6 +184,17 @@ Quality checks:
 
 Free-form 256-token prose/code generations were coherent but not byte-stable across repeated prefix-cache runs, including the dense control. They should not be interpreted as an exact-output gate.
 
+### Shape-gated q8_0 decode projection
+
+Isolated same-session ABBA for `m=32768, n=1, k=1024` measured:
+
+| Path | Mean time |
+|---|---:|
+| Generic q8_0 dequantize-matvec | 155.495 us |
+| Four-row shape-gated pipeline | 87.375 us |
+
+That is a 43.8% operation-latency reduction (1.78x speedup). Two 512-token full-model campaigns, one ABBA and one reverse BAAB, retained identical output SHA-256 hashes in every arm. Candidate latency improved by 0.8% in the first campaign and 5.2% in the reverse campaign; pooling all eight arms gave a 3.1% mean latency reduction. Firmware power drift was substantial, so the campaign range is more honest than treating the pooled figure as a guaranteed token-rate gain.
+
 ### Query-private follow-up
 
 A same-session 32K-prefix comparison against the previous concatenated compact implementation measured:
@@ -184,6 +214,7 @@ The fork-specific sequence is:
 - `5b6443d4` — adaptive DSpark depth;
 - `109292da` — q8_0 sparse decode gathering;
 - `2ba5970d` — batched speculative gathering;
-- `05b82c24` — query-private sparse verification segments.
+- `05b82c24` — query-private sparse verification segments;
+- `7c3b67b3` — shape-gated four-row q8_0 decode projection.
 
 The untouched non-sparse adaptive runtime remains a straightforward rollback target, and `GGML_VK_FA_TOPK_GATHER=0` provides a same-binary control.
