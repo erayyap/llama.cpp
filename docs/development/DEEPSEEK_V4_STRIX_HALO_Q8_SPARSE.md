@@ -57,15 +57,11 @@ export GGML_VK_FA_TOPK_GATHER=0
 
 DSpark verifies multiple candidate tokens in one target-model batch. The compact path therefore supports query batches from 1 through 8.
 
-For a batch of `N` queries, scratch K contains:
+The initial batched implementation concatenated a shared raw prefix with every query's top-k segment. Each query then attended across that whole rectangle while masking the other queries' segments. This was much faster than scanning the deep cache, but its attention work grew approximately quadratically with speculative depth.
 
-- the shared raw prefix;
-- one top-k segment for each query;
-- alignment padding.
+The retained query-private layout instead gathers one independently padded `raw prefix + top-k` segment per query. The host issues one single-query flash-attention dispatch per segment, with correctly offset Q, output, mask, and multi-stream scratch views. This duplicates the raw-prefix gather for tiny batches but substantially reduces attention work. Split-K is disabled for these private dispatches because 64 query-head workgroups already fill the tested GPU and independent split temporaries would add overhead.
 
-Each compact mask exposes the raw prefix and only that query's selected segment. Selections are intentionally not deduplicated across queries: batches are small, this avoids a GPU hash/union pass, and it remains much cheaper than scanning a deep full cache.
-
-The path engages only when the complete source cache is at least twice the padded compact set. Otherwise it keeps the existing dense path.
+The path supports batches 1 through 8 and engages when the complete source cache is at least twice one padded private active set. Otherwise it keeps the existing dense path.
 
 ## Build
 
@@ -127,13 +123,15 @@ The focused q8 cases passed against the CPU reference. A broader Vulkan q8 flash
 
 At 32,768 compressed K rows, `n_kv_raw=1024`, and `n_top_k=512`:
 
-| Query batch | Dense q8_0 | Compact gather | Speedup | Latency reduction |
+| Query batch | Dense q8_0 | Concatenated compact | Query-private compact | Private vs concatenated |
 |---:|---:|---:|---:|---:|
-| 1 | 2878.375 us | 71.320 us | 40.36x | 97.52% |
-| 2 | 17556.780 us | 522.435 us | 33.61x | 97.02% |
-| 3 | 17756.890 us | 673.615 us | 26.36x | 96.21% |
-| 5 | 18248.440 us | 953.985 us | 19.13x | 94.77% |
-| 6 | 18394.755 us | 1095.935 us | 16.78x | 94.04% |
+| 1 | 2878.375 us | 71.320 us | ~72 us | neutral |
+| 2 | 17556.780 us | 524.455 us | 143.150 us | 3.66x faster |
+| 3 | 17756.890 us | 665.190 us | 246.300 us | 2.70x faster |
+| 5 | 18248.440 us | 976.045 us | 474.025 us | 2.06x faster |
+| 6 | 18394.755 us | 1123.485 us | 614.730 us | 1.83x faster |
+
+The concatenated/private columns for batches 2–6 are same-session ABBA means. Query-private latency reductions versus the concatenated implementation were 72.70%, 62.97%, 51.43%, and 45.28%, respectively.
 
 Single-query context sweep:
 
@@ -165,12 +163,25 @@ Quality checks:
 
 Free-form 256-token prose/code generations were coherent but not byte-stable across repeated prefix-cache runs, including the dense control. They should not be interpreted as an exact-output gate.
 
+### Query-private follow-up
+
+A same-session 32K-prefix comparison against the previous concatenated compact implementation measured:
+
+| Workload | Concatenated compact | Query-private compact | Change |
+|---|---:|---:|---:|
+| Low-acceptance prose | 10.56 tok/s | 10.79 tok/s | +2.2% |
+| High-acceptance code | 15.64 tok/s | 17.88 tok/s | +14.3% |
+| Ten-case deep gate mean | 14.11 tok/s | 16.51 tok/s | +17.0% |
+
+The deep gate remained byte-identical on 10/10 outputs and semantically identical at 9/10 versus 9/10; the shared arithmetic miss was again caused by the synthetic archive prefix. Focused q8 correctness passed batches 1, 2, 3, 5, and 6, including sinks, invalid indices, per-query masks, and a two-stream batch-5 case.
+
 ## Commits
 
 The fork-specific sequence is:
 
 - `5b6443d4` — adaptive DSpark depth;
 - `109292da` — q8_0 sparse decode gathering;
-- `2ba5970d` — batched speculative gathering.
+- `2ba5970d` — batched speculative gathering;
+- `05b82c24` — query-private sparse verification segments.
 
 The untouched non-sparse adaptive runtime remains a straightforward rollback target, and `GGML_VK_FA_TOPK_GATHER=0` provides a same-binary control.
