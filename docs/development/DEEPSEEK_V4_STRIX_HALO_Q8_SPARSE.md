@@ -207,6 +207,35 @@ A same-session 32K-prefix comparison against the previous concatenated compact i
 
 The deep gate remained byte-identical on 10/10 outputs and semantically identical at 9/10 versus 9/10; the shared arithmetic miss was again caused by the synthetic archive prefix. Focused q8 correctness passed batches 1, 2, 3, 5, and 6, including sinks, invalid indices, per-query masks, and a two-stream batch-5 case.
 
+## 128K follow-up profiling and rejected indexer experiments
+
+A full 409,600-context server with the Vulkan per-node performance logger enabled destabilized the desktop during a 32K request and required a restart. No retained result depends on that run. Full-model performance logging at the 400K allocation is therefore not considered desktop-safe; the follow-up used bounded backend-operation graphs at 128K and ordinary, non-profiled full-model validation at `ctx=131072`, `b1024/ub1024`.
+
+The retained q8 query-private attention operation stayed effectively constant as the compressed cache grew. With `n_kv_raw=1024` and `n_top_k=512`:
+
+| Compressed K rows | Batch 1 | Batch 2 | Batch 5 |
+|---:|---:|---:|---:|
+| 8,192 | 73.87 us | 146.46 us | 463.56 us |
+| 32,768 | 73.05 us | 148.42 us | 457.33 us |
+| 65,536 | 72.48 us | 145.57 us | 451.20 us |
+| 131,072 | 72.62 us | 147.05 us | 454.89 us |
+
+The long-context growth instead appeared in `LIGHTNING_INDEXER`. The existing cooperative-matrix decode kernel is selected for one token, while batches 2–5 use the exact scalar/subgroup path:
+
+| K rows | Batch 1 | Batch 2 | Batch 5 |
+|---:|---:|---:|---:|
+| 4,096 | 13.60 us | 90.69 us | 219.61 us |
+| 65,536 | 137.65 us | 1,378.06 us | 3,465.73 us |
+| 131,072 | 293.36 us | 2,769.65 us | 7,070.51 us |
+
+Three experiments were screened and removed:
+
+1. **Cooperative-matrix decode for batches 2–8.** The shader already accepted a token index, so extending pipeline selection reduced operation latency by roughly 80–82% at 64K and 80% at 128K (about 4.9–5.6x). It passed the ordinary fixed gate with 10/10 exact reference hashes, but only 8/10 outputs matched the established control hashes behind the fixed 32K prefix. Although semantic validity changed from 9/10 to 10/10, the exact-output policy required rejection.
+2. **Two-query cooperative-matrix workgroups sharing K tiles.** This was 23–48% slower than independent one-query workgroups, so it was removed before full-model testing.
+3. **Exact-order scalar groups widened from 8 to 16 keys.** This preserved the original subgroup reduction and head accumulation order, but isolated gains fell from about 2.2% at 64K to 0.4–1.2% at 128K, below a meaningful full-model threshold. It was removed.
+
+No indexer experiment from this follow-up is present in the retained runtime. The production service remained inactive and disabled throughout final cleanup.
+
 ## Commits
 
 The fork-specific sequence is:
