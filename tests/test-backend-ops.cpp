@@ -10021,6 +10021,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(1024,  64,  65, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 257, 256, 512, false));
+    // Quantized sparse-prefill caches are dequantized once into f16 scratch.
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, tk, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, tk, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false, tk, 1));
+    }
 
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
@@ -10515,6 +10521,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // PP2048 compressed-K rows for source context depths 32k through 512k.
     for (int kv : { 11008, 19200, 35584, 68352, 133888 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 2048, 2304, 512, false));
+    }
+    // Quantized prefill path: compare one-shot dequantized caches with f16.
+    for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int kv : { 5504, 11008, 19200, 35584 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1024, 2304, 512, false, tk));
+        }
     }
 
     return test_cases;
