@@ -34,6 +34,8 @@ The controller:
 - increases depth at high acceptance and backs off at low acceptance;
 - leaves the original static behavior unchanged when the environment variable is absent.
 
+The tested Q8 DSpark artifact declares `dflash.block_size=5`. Requests for depths 6–8 are therefore clamped to 5 by the drafter even though the sparse-attention backend itself is correctness-tested through batch 8.
+
 ### q8_0 sparse decode gathering
 
 DeepSeek V4 compressed sparse attention carries a dense raw prefix plus top-k compressed-cache indices. Before this change, the Vulkan gather-to-compact decode path accepted only f16 K/V. A production q8_0 cache therefore fell back to flash attention across the complete compressed cache despite most rows being masked.
