@@ -73,6 +73,14 @@ A bounded non-speculative Vulkan profile found ordinary q8_0 matrix-vector proje
 
 Global row coarsening, forced integer-dot MMVQ, wave32, and 256-thread decode-vector workgroups were screened and rejected because they were mixed or slower at full-model level.
 
+### Long-context cooperative-matrix indexer batches
+
+DeepSeek V4's lightning indexer chooses compressed-cache rows for sparse attention. The existing cooperative-matrix decode shader was used only for a one-token graph; speculative verification batches of 2–5 fell back to a much slower scalar/subgroup shader even though the cooperative-matrix shader already supports an arbitrary token index.
+
+`GGML_VK_LIGHTNING_DECODE_CM_BATCH=N` extends the cooperative-matrix shader through batch `N`, clamped to 0–8. Leaving the variable unset or setting it to `0` preserves the prior selector. The production DSpark configuration uses `N=5`; testing through 8 covers the backend's supported verification range.
+
+This path is numerically different from the scalar kernel because it converts query inputs to f16 cooperative-matrix operands and changes floating-point evaluation. It is therefore accepted on semantic correctness, perplexity, and task accuracy rather than byte-identical generated text. Keep the environment control available for workload-specific rollback.
+
 ## Build
 
 ```bash
@@ -93,6 +101,7 @@ Replace model paths with compatible GGUF files:
 LLAMA_DSPARK_ADAPTIVE=1 \
 GGML_VK_FA_TOPK_GATHER=1 \
 GGML_VK_Q8_DMMV_ROWS4=1 \
+GGML_VK_LIGHTNING_DECODE_CM_BATCH=5 \
 ./build-vulkan/bin/llama-server \
   -m /path/to/deepseek-v4-flash.gguf \
   -md /path/to/dspark-q8_0.gguf \
@@ -228,13 +237,24 @@ The long-context growth instead appeared in `LIGHTNING_INDEXER`. The existing co
 | 65,536 | 137.65 us | 1,378.06 us | 3,465.73 us |
 | 131,072 | 293.36 us | 2,769.65 us | 7,070.51 us |
 
-Three experiments were screened and removed:
+The cooperative-matrix selector reduced operation latency by roughly 80–82% at 64K and 80% at 128K (about 4.9–5.6x). Under the later semantic-quality policy it was promoted after these additional comparisons:
 
-1. **Cooperative-matrix decode for batches 2–8.** The shader already accepted a token index, so extending pipeline selection reduced operation latency by roughly 80–82% at 64K and 80% at 128K (about 4.9–5.6x). It passed the ordinary fixed gate with 10/10 exact reference hashes, but only 8/10 outputs matched the established control hashes behind the fixed 32K prefix. Although semantic validity changed from 9/10 to 10/10, the exact-output policy required rejection.
-2. **Two-query cooperative-matrix workgroups sharing K tiles.** This was 23–48% slower than independent one-query workgroups, so it was removed before full-model testing.
-3. **Exact-order scalar groups widened from 8 to 16 keys.** This preserved the original subgroup reduction and head accumulation order, but isolated gains fell from about 2.2% at 64K to 0.4–1.2% at 128K, below a meaningful full-model threshold. It was removed.
+| Quality benchmark | Scalar control | Cooperative-matrix batch | Result |
+|---|---:|---:|---|
+| WikiText-2, 512 context, 1 chunk | 4.9479 ± 0.85308 PPL | 4.9479 ± 0.85308 PPL | identical reported estimate |
+| WikiText-2, 4096 context, 4 chunks | 4.6142 ± 0.12718 PPL | 4.6146 ± 0.12717 PPL | +0.0004 PPL; negligible versus uncertainty |
+| Serial HellaSwag subset | 83/100 | 83/100 | 100/100 answers matched |
+| Serial Winogrande subset | 73/100 | 73/100 | 100/100 answers matched |
+| Fixed 32K-prefix semantic gate | 9/10 | 10/10 | candidate corrected the prefix-confounded arithmetic case |
 
-No indexer experiment from this follow-up is present in the retained runtime. The production service remained inactive and disabled throughout final cleanup.
+All 200 serial multiple-choice outputs matched byte-for-byte despite exact identity not being required. Mean decode throughput was 4.4% higher on the HellaSwag subset and 3.9% higher on Winogrande. The ordinary fixed gate remained 10/10 semantically valid and 10/10 exact; the deep gate matched 8/10 hashes, demonstrating why exact hashes remain useful diagnostics but are not a quality metric by themselves.
+
+Two follow-up experiments remained rejected:
+
+1. **Two-query cooperative-matrix workgroups sharing K tiles.** This was 23–48% slower than independent one-query workgroups.
+2. **Exact-order scalar groups widened from 8 to 16 keys.** Isolated gains fell from about 2.2% at 64K to 0.4–1.2% at 128K, below a meaningful full-model threshold.
+
+The production service remained inactive and disabled throughout testing.
 
 ## Commits
 
@@ -244,6 +264,7 @@ The fork-specific sequence is:
 - `109292da` — q8_0 sparse decode gathering;
 - `2ba5970d` — batched speculative gathering;
 - `05b82c24` — query-private sparse verification segments;
-- `7c3b67b3` — shape-gated four-row q8_0 decode projection.
+- `7c3b67b3` — shape-gated four-row q8_0 decode projection;
+- cooperative-matrix lightning-indexer batches — opt-in long-context speculative verification acceleration.
 
 The untouched non-sparse adaptive runtime remains a straightforward rollback target, and `GGML_VK_FA_TOPK_GATHER=0` provides a same-binary control.

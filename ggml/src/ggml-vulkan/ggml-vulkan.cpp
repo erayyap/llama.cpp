@@ -4206,6 +4206,20 @@ static bool ggml_vk_q8_dmmv_rows4_enabled() {
     return enabled;
 }
 
+// The cooperative-matrix decode indexer is substantially faster at long context,
+// but changes floating-point evaluation versus the scalar subgroup kernel. Keep it
+// opt-in and bounded to the configured speculative batch width (2..8).
+static uint32_t ggml_vk_lightning_decode_cm_max_batch() {
+    static const uint32_t max_batch = [] {
+        const char * env = getenv("GGML_VK_LIGHTNING_DECODE_CM_BATCH");
+        if (env == nullptr) {
+            return 0u;
+        }
+        return (uint32_t) std::clamp(atoi(env), 0, 8);
+    }();
+    return max_batch;
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -12430,7 +12444,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_LIGHTNING_INDEXER:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && src0->ne[2] == 1) {
+            const bool decode_cm_batch = src0->ne[2] == 1 ||
+                (src0->ne[2] >= 2 && src0->ne[2] <= ggml_vk_lightning_decode_cm_max_batch());
+            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && decode_cm_batch) {
                 return ctx->device->pipeline_lightning_indexer_decode_cm_f16;
             }
             return ctx->device->pipeline_lightning_indexer_cm_f16 && src0->ne[2] >= 16 ?

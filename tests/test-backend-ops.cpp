@@ -10350,6 +10350,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1792, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
+    // DeepSeek V4 long-context speculative-decode indexer shapes. These make the
+    // scalar versus cooperative-matrix batch selector directly benchmarkable.
+    for (int kv : { 4096, 65536, 131072 }) {
+        for (int bs : { 2, 5 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, GGML_TYPE_F16));
+        }
+    }
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 131072, 1, 1, 1, GGML_TYPE_F16));
+
     // lightning_indexer
     for (int kv : { 256, 512, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
