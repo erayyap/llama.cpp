@@ -1253,11 +1253,19 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
-    // keep indexer keys f16 regardless of type_k: the fused indexer kernels read
-    // f16 only, and quantizing this small cache (128 dims) saves little while
-    // forcing the much slower decomposed indexer path
+    // Quantizing the independent 128-wide lightning-indexer cache is opt-in. Vulkan has
+    // native q8_0 scalar and cooperative-matrix indexer kernels; other backends can leave
+    // this unset and retain the established f16 cache. The public K type must also be q8_0
+    // so an accidental environment setting cannot silently override a requested cache type.
+    static const bool lid_q8 = [] {
+        const char * env = std::getenv("LLAMA_DSV4_LID_Q8_0");
+        return env && env[0] == '1';
+    }();
+    const ggml_type type_k_lid = lid_q8 && type_k == GGML_TYPE_Q8_0 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    LLAMA_LOG_INFO("%s: DSV4 lightning-indexer K type = %s\n", __func__, ggml_type_name(type_k_lid));
+
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, GGML_TYPE_F16, type_v,
+            model, hparams_lid, type_k_lid, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 

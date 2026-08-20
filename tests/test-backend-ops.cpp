@@ -7483,6 +7483,83 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER + GGML_OP_TOP_K. This keeps the producer and
+// consumer in one bounded graph so backends can validate and benchmark the
+// optional block-local candidate fusion rather than timing the operations in
+// isolation.
+struct test_lightning_indexer_top_k : public test_case {
+    const int64_t kv;
+    const int64_t nb;
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR3(kv, nb, type_K);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ((2 * 128 + 2) * 64 + 1) * kv * nb;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<int32_t> ia(n);
+        std::vector<int32_t> ib(n);
+        double diff = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            ia[i] = (int32_t) a[i];
+            ib[i] = (int32_t) b[i];
+            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
+        }
+        return diff + jdst(ia.data(), ib.data(), n);
+    }
+
+    test_lightning_indexer_top_k(int64_t kv, int64_t nb, ggml_type type_K)
+        : kv(kv), nb(nb), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 64, nb, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, 128, 1, kv, 1);
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nb, 1, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        for (ggml_tensor * t : { q, k, w, m }) {
+            ggml_set_param(t);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(w, "w");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * score = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(score, "score");
+        ggml_tensor * out = ggml_top_k(ctx, score, std::min<int64_t>(512, kv));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // Make the final 512 positions uniquely larger than every other
+                // position. This validates candidate retention independently of
+                // accepted f16 cooperative-matrix score rounding.
+                std::vector<ggml_fp16_t> mask(ggml_nelements(t));
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    for (int64_t col = 0; col < t->ne[0]; ++col) {
+                        const float value = col >= t->ne[0] - 512 ?
+                            1.0f + (float)(col - (t->ne[0] - 512)) / 512.0f : -1.0f;
+                        mask[row * t->ne[0] + col] = ggml_fp32_to_fp16(value);
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(mask[0]));
+            } else {
+                ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -9904,11 +9981,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // batch 1 = Vulkan decode-cm variant, 4/15 = scalar subgroup variant (below the cm
     // threshold of 16, 15 is the boundary), 17/512 = cm prefill variant
-    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   1, 1, 1, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   4, 1, 1, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  15, 1, 1, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, GGML_TYPE_F16));
+    for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   1, 1, 1, type_K));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   2, 1, 1, type_K));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   5, 1, 1, type_K));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  15, 1, 1, type_K));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, type_K));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, type_K));
+        for (int bs : { 1, 2, 5 }) {
+            test_cases.emplace_back(new test_lightning_indexer_top_k(4096, bs, type_K));
+        }
+    }
 
     // sparse top-k FA: (kv, nb, n_kv_raw, n_top_k, sinks). The Vulkan sparse path engages
     // when kv >= 3*(n_kv_raw + n_top_k) AND nb >= 64 (prefill-only); the nb < 64 cases
@@ -10287,6 +10370,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
+    // DeepSeek V4 lightning-indexer selection shapes. Keep these next to the
+    // matching long-context LIGHTNING_INDEXER cases above so score generation
+    // and selection can be budgeted independently before attempting fusion.
+    for (auto nrows : {1, 2, 5}) {
+        for (auto cols : {4096, 65536, 131072}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
+        }
+    }
     for (auto k : {1, 10, 40, 400}) {
         for (auto nrows : {1, 16}) {
             for (auto cols : {k, 1000, 65000, 200000}) {
@@ -10354,10 +10445,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // scalar versus cooperative-matrix batch selector directly benchmarkable.
     for (int kv : { 4096, 65536, 131072 }) {
         for (int bs : { 2, 5 }) {
-            test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, GGML_TYPE_F16));
+            for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, type_K));
+            }
         }
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 131072, 1, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 131072, 1, 1, 1, GGML_TYPE_Q8_0));
+    for (int kv : { 4096, 65536, 131072 }) {
+        for (int bs : { 1, 2, 5 }) {
+            for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_lightning_indexer_top_k(kv, bs, type_K));
+            }
+        }
+    }
 
     // lightning_indexer
     for (int kv : { 256, 512, 4096, 65536 }) {

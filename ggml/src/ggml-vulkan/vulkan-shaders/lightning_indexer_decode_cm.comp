@@ -6,11 +6,19 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 
+#if defined(DATA_K_Q8_0)
+#include "types.glsl"
+#endif
+
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly  buffer QBuf   { float     data_q[];    };
+#if defined(DATA_K_Q8_0)
+layout(binding = 1) readonly  buffer KBuf   { block_q8_0 data_k[];   };
+#else
 layout(binding = 1) readonly  buffer KBuf   { float16_t data_k[];    };
+#endif
 layout(binding = 2) readonly  buffer WBuf   { float     data_w[];    };
 layout(binding = 3) readonly  buffer MBuf   { float16_t data_m[];    };
 layout(binding = 4) writeonly buffer DstBuf { float     data_dst[];  };
@@ -44,23 +52,53 @@ shared f16vec4 q_sh[TILE * TILE_STRIDE];
 shared f16vec4 k_sh[TILE * TILE_STRIDE];
 shared vec4 score_sh[TILE * SCORE_STRIDE];
 
+#if !defined(DATA_K_Q8_0)
+f16vec4 load_k4(uint stream, uint kv, uint d4) {
+    const uint offset = stream * p.nbk3 + kv * p.nbk2 + d4 * 4;
+    return f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
+}
+#endif
+
 void main() {
     const uint tid = gl_LocalInvocationIndex;
     const uint kv_base = gl_WorkGroupID.x * TILE;
     const uint token = gl_WorkGroupID.y;
     const uint stream = gl_WorkGroupID.z;
 
+#if defined(DATA_K_Q8_0)
+    // One lane expands one complete 32-value block. This reads each 34-byte q8_0
+    // block only once instead of reloading its scale for every four values.
+    for (uint idx = tid; idx < TILE * 4; idx += SUBGROUP_SIZE) {
+        const uint key = idx / 4;
+        const uint block = idx % 4;
+        const uint kv = kv_base + key;
+        if (kv < p.n_kv) {
+            const block_q8_0 value = data_k[stream * p.nbk3 + kv * p.nbk2 + block];
+            const float d = float(value.d);
+            [[unroll]] for (uint i = 0; i < 8; ++i) {
+                const uint q = i * 4;
+                k_sh[key * TILE_STRIDE + block * 8 + i] = f16vec4(
+                    d * float(value.qs[q]), d * float(value.qs[q + 1]),
+                    d * float(value.qs[q + 2]), d * float(value.qs[q + 3]));
+            }
+        } else {
+            [[unroll]] for (uint i = 0; i < 8; ++i) {
+                k_sh[key * TILE_STRIDE + block * 8 + i] = f16vec4(0.0);
+            }
+        }
+    }
+#else
     for (uint idx = tid; idx < TILE * VEC_PER_HEAD; idx += SUBGROUP_SIZE) {
         const uint key = idx / VEC_PER_HEAD;
         const uint d4 = idx % VEC_PER_HEAD;
         const uint kv = kv_base + key;
         f16vec4 value = f16vec4(0.0);
         if (kv < p.n_kv) {
-            const uint offset = stream * p.nbk3 + kv * p.nbk2 + d4 * 4;
-            value = f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
+            value = load_k4(stream, kv, d4);
         }
         k_sh[key * TILE_STRIDE + d4] = value;
     }
+#endif
     barrier();
 
     float total = 0.0;

@@ -6,11 +6,19 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 
+#if defined(DATA_K_Q8_0)
+#include "types.glsl"
+#endif
+
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly  buffer QBuf    { float     data_q[];   };
+#if defined(DATA_K_Q8_0)
+layout(binding = 1) readonly  buffer KBuf    { block_q8_0 data_k[];  };
+#else
 layout(binding = 1) readonly  buffer KBuf    { float16_t data_k[];   };
+#endif
 layout(binding = 2) readonly  buffer WBuf    { float     data_w[];   };
 layout(binding = 3) readonly  buffer MaskBuf { float16_t data_m[];   };
 layout(binding = 4) writeonly buffer DstBuf  { float     data_dst[]; };
@@ -36,6 +44,15 @@ layout(push_constant) uniform Parameters {
 const uint K_PER_GROUP = 8;
 const uint N_HEAD = 64;
 
+float load_k1(uint stream, uint kv, uint dim) {
+#if defined(DATA_K_Q8_0)
+    const block_q8_0 value = data_k[stream * p.nbk3 + kv * p.nbk2 + dim / 32];
+    return float(value.d) * float(value.qs[dim % 32]);
+#else
+    return float(data_k[stream * p.nbk3 + kv * p.nbk2 + dim]);
+#endif
+}
+
 void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint token = gl_WorkGroupID.y;
@@ -51,9 +68,8 @@ void main() {
     [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
         const uint kv = kv_base + j;
         if (kv < p.n_kv) {
-            const uint k_base = stream * p.nbk3 + kv * p.nbk2;
-            k0[j] = float(data_k[k_base + lane]);
-            k1[j] = float(data_k[k_base + lane + SUBGROUP_SIZE]);
+            k0[j] = load_k1(stream, kv, lane);
+            k1[j] = load_k1(stream, kv, lane + SUBGROUP_SIZE);
         } else {
             k0[j] = 0.0;
             k1[j] = 0.0;

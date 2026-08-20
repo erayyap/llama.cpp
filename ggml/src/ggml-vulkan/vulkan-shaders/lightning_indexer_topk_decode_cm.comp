@@ -1,0 +1,206 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+#if defined(DATA_K_Q8_0)
+#include "types.glsl"
+#endif
+
+layout(constant_id = 0) const uint LOCAL_SIZE = 256;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf   { float     data_q[];   };
+#if defined(DATA_K_Q8_0)
+layout(binding = 1) readonly  buffer KBuf   { block_q8_0 data_k[]; };
+#else
+layout(binding = 1) readonly  buffer KBuf   { float16_t data_k[];  };
+#endif
+layout(binding = 2) readonly  buffer WBuf   { float     data_w[];   };
+layout(binding = 3) readonly  buffer MBuf   { float16_t data_m[];   };
+layout(binding = 4) writeonly buffer DstBuf { ivec2    data_dst[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_batch;
+    uint n_stream;
+    uint nem3;
+    uint nb1;
+    uint nb3;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk2;
+    uint nbk3;
+    uint nbw1;
+    uint nbw3;
+    uint nbm1;
+    uint nbm3;
+    uint n_partial;
+} p;
+
+const uint TILE = 16;
+const uint BLOCK_KEYS = 1024;
+const uint KEEP = 512;
+const uint N_SUBGROUP = 4;
+const uint N_ROUND = BLOCK_KEYS / (N_SUBGROUP * TILE);
+const uint HEAD_SIZE = 128;
+const uint N_HEAD = 64;
+const uint VEC_PER_HEAD = HEAD_SIZE / 4;
+const uint TILE_STRIDE = VEC_PER_HEAD + 2;
+const uint SCORE_STRIDE = TILE / 4 + 1;
+
+shared f16vec4 q_sh[TILE * TILE_STRIDE];
+shared f16vec4 k_sh[N_SUBGROUP * TILE * TILE_STRIDE];
+shared vec4 score_sh[N_SUBGROUP * TILE * SCORE_STRIDE];
+shared ivec2 candidates[BLOCK_KEYS];
+
+#if !defined(DATA_K_Q8_0)
+f16vec4 load_k4(uint stream, uint kv, uint d4) {
+    const uint offset = stream * p.nbk3 + kv * p.nbk2 + d4 * 4;
+    return f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
+}
+#endif
+
+bool better(ivec2 a, ivec2 b) {
+    const bool av = uint(a.x) < p.n_kv;
+    const bool bv = uint(b.x) < p.n_kv;
+    if (av != bv) {
+        return av;
+    }
+    if (!av) {
+        return false;
+    }
+    const float af = intBitsToFloat(a.y);
+    const float bf = intBitsToFloat(b.y);
+    return af > bf || (af == bf && a.x < b.x);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint key_block = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint stream = gl_WorkGroupID.z;
+
+    for (uint round = 0; round < N_ROUND; ++round) {
+        const uint tile = round * N_SUBGROUP + sg;
+        const uint kv_base = key_block * BLOCK_KEYS + tile * TILE;
+        const uint k_sh_base = sg * TILE * TILE_STRIDE;
+        const uint score_sh_base = sg * TILE * SCORE_STRIDE;
+
+#if defined(DATA_K_Q8_0)
+        // Four q8_0 blocks per 128-wide key. Sixteen keys exactly fill one subgroup.
+        const uint key = lane / 4;
+        const uint block = lane % 4;
+        const uint kv = kv_base + key;
+        if (kv < p.n_kv) {
+            const block_q8_0 value = data_k[stream * p.nbk3 + kv * p.nbk2 + block];
+            const float d = float(value.d);
+            [[unroll]] for (uint i = 0; i < 8; ++i) {
+                const uint q = i * 4;
+                k_sh[k_sh_base + key * TILE_STRIDE + block * 8 + i] = f16vec4(
+                    d * float(value.qs[q]), d * float(value.qs[q + 1]),
+                    d * float(value.qs[q + 2]), d * float(value.qs[q + 3]));
+            }
+        } else {
+            [[unroll]] for (uint i = 0; i < 8; ++i) {
+                k_sh[k_sh_base + key * TILE_STRIDE + block * 8 + i] = f16vec4(0.0);
+            }
+        }
+#else
+        for (uint idx = lane; idx < TILE * VEC_PER_HEAD; idx += SUBGROUP_SIZE) {
+            const uint key = idx / VEC_PER_HEAD;
+            const uint d4 = idx % VEC_PER_HEAD;
+            const uint kv = kv_base + key;
+            f16vec4 value = f16vec4(0.0);
+            if (kv < p.n_kv) {
+                value = load_k4(stream, kv, d4);
+            }
+            k_sh[k_sh_base + key * TILE_STRIDE + d4] = value;
+        }
+#endif
+        barrier();
+
+        float total = 0.0;
+        for (uint head_base = 0; head_base < N_HEAD; head_base += TILE) {
+            // Q is common to all four K tiles, so load it only once per workgroup.
+            for (uint idx = tid; idx < TILE * VEC_PER_HEAD; idx += LOCAL_SIZE) {
+                const uint head_local = idx / VEC_PER_HEAD;
+                const uint d4 = idx % VEC_PER_HEAD;
+                const uint head = head_base + head_local;
+                const uint offset = stream * p.nbq3 + token * p.nbq2 + head * p.nbq1 + d4 * 4;
+                q_sh[head_local * TILE_STRIDE + d4] =
+                    f16vec4(data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
+            }
+            barrier();
+
+            coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> scores =
+                coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> kmat;
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> qmat;
+
+            [[unroll]] for (uint d = 0; d < HEAD_SIZE; d += TILE) {
+                coopMatLoad(kmat, k_sh, k_sh_base + d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(qmat, q_sh, d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                scores = coopMatMulAdd(kmat, qmat, scores);
+            }
+
+            coopMatStore(scores, score_sh, score_sh_base, SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+
+            if (lane < TILE && kv_base + lane < p.n_kv) {
+                [[unroll]] for (uint head_local = 0; head_local < TILE; ++head_local) {
+                    const float score = score_sh[score_sh_base + lane * SCORE_STRIDE + head_local / 4][head_local % 4];
+                    const float weight = data_w[stream * p.nbw3 + token * p.nbw1 + head_base + head_local];
+                    total += max(score, 0.0) * weight;
+                }
+            }
+            barrier();
+        }
+
+        if (lane < TILE) {
+            const uint local_key = tile * TILE + lane;
+            const uint kv = kv_base + lane;
+            if (kv < p.n_kv) {
+                const uint mask_base = (stream % p.nem3) * p.nbm3 + token * p.nbm1;
+                const float value = total + float(data_m[mask_base + kv]);
+                candidates[local_key] = ivec2(int(kv), floatBitsToInt(value));
+            } else {
+                candidates[local_key] = ivec2(int(p.n_kv), int(0xff800000u));
+            }
+        }
+        barrier();
+    }
+
+    // Descending bitonic sort. Four comparisons per invocation per stage keep the
+    // workgroup at four active wave64 subgroups rather than launching 1024 threads.
+    for (uint k = 2; k <= BLOCK_KEYS; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = tid; i < BLOCK_KEYS; i += LOCAL_SIZE) {
+                const uint ixj = i ^ j;
+                if (ixj > i) {
+                    const ivec2 a = candidates[i];
+                    const ivec2 b = candidates[ixj];
+                    const bool descending = (i & k) == 0;
+                    if ((descending && better(b, a)) || (!descending && better(a, b))) {
+                        candidates[i] = b;
+                        candidates[ixj] = a;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    const uint row = stream * p.n_batch + token;
+    for (uint i = tid; i < KEEP; i += LOCAL_SIZE) {
+        data_dst[row * p.n_partial + key_block * KEEP + i] = candidates[i];
+    }
+}

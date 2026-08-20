@@ -81,6 +81,16 @@ DeepSeek V4's lightning indexer chooses compressed-cache rows for sparse attenti
 
 This path is numerically different from the scalar kernel because it converts query inputs to f16 cooperative-matrix operands and changes floating-point evaluation. It is therefore accepted on semantic correctness, perplexity, and task accuracy rather than byte-identical generated text. Keep the environment control available for workload-specific rollback.
 
+### Experimental q8_0 indexer cache and fused top-k
+
+Two additional long-context paths are implemented but are **not production-promoted** because fixed 32K-prefix model throughput was mixed/neutral despite strong bounded-operation gains.
+
+`LLAMA_DSV4_LID_Q8_0=1` stores the independent 128-wide lightning-indexer K cache as q8_0 when the public K cache is also q8_0. Vulkan scalar, prefill cooperative-matrix, and decode cooperative-matrix shaders dequantize one complete q8_0 block per lane directly into shared f16 tiles. Unset or `0` retains f16. The q8 and f16 cache-state files are not mutually restorable, so deployments testing this switch should use a separate slot-save directory.
+
+`GGML_VK_LIGHTNING_TOPK_FUSE=1` combines decode indexer scoring with the first top-k reduction. Four wave64 subgroups score 1,024 keys per workgroup, retain 512 block-local candidates, and feed those `(index, score)` pairs into the existing top-k merge passes. It defaults to compressed KV lengths of at least 32,768; `GGML_VK_LIGHTNING_TOPK_MIN_KV` overrides that threshold. Unset or `0` preserves the separate indexer and top-k operations.
+
+The fusion deliberately remains off by default. It is numerically different at top-k boundaries, and safe full-model profiling/filling at the production 400K allocation was not repeated after the earlier UMA overcommit.
+
 ## Build
 
 ```bash
@@ -249,7 +259,26 @@ The cooperative-matrix selector reduced operation latency by roughly 80–82% at
 
 All 200 serial multiple-choice outputs matched byte-for-byte despite exact identity not being required. Mean decode throughput was 4.4% higher on the HellaSwag subset and 3.9% higher on Winogrande. The ordinary fixed gate remained 10/10 semantically valid and 10/10 exact; the deep gate matched 8/10 hashes, demonstrating why exact hashes remain useful diagnostics but are not a quality metric by themselves.
 
-Two follow-up experiments remained rejected:
+A later q8-cache and fused-top-k campaign produced these bounded results:
+
+| Path | 65K K, batch 1 | 65K K, batch 5 | 131K K, batch 1 | 131K K, batch 5 |
+|---|---:|---:|---:|---:|
+| f16 cooperative-matrix indexer | 140.54 us | 684.32 us | 298.49 us | 1,425.47 us |
+| q8_0 cooperative-matrix indexer | 128.77 us | 615.10 us | 252.62 us | 1,258.18 us |
+| q8 improvement | 8.4% | 10.1% | 15.4% | 11.7% |
+
+The q8 row size is 136 bytes versus 256 bytes for f16, a 46.9% reduction in indexer-cache storage. Focused q8 scalar/prefill/decode tests passed 18/18 against CPU reference. WikiText-2 remained 4.9479 at 512 context; at 4096 context the estimate changed from 4.6146 ± 0.12717 to 4.6183 ± 0.12736 (+0.08%). HellaSwag and Winogrande serial subsets remained 83/100 and 73/100 with all 200 outputs matching the f16-indexer candidate.
+
+At 131K compressed K, fused q8 scoring plus top-k took about 99 us / 162 us / 391 us for batches 1/2/5. The corresponding separate q8 indexer plus top-k budget was roughly 338 us / 644 us / 1,595 us, a 71–76% operation reduction. Structured block-candidate tests passed for f16 and q8_0 at batches 1/2/5; ordinary and deep server outputs matched the unfused q8 candidate on the fixed gates.
+
+Whole-model 32K-prefix ABBA/BAAB was neutral and workload-dependent:
+
+- q8 cache alone: +5.0% prose, -2.7% code, +0.3% pooled;
+- fused top-k over q8: -1.7% prose, +2.0% code, +0.5% pooled.
+
+Those prompts contain only about 8K compressed indexer rows and are below the retained fusion threshold. The paths remain opt-in experiments pending safe validation at materially deeper cache residency.
+
+Two earlier follow-up experiments remained rejected:
 
 1. **Two-query cooperative-matrix workgroups sharing K tiles.** This was 23–48% slower than independent one-query workgroups.
 2. **Exact-order scalar groups widened from 8 to 16 keys.** Isolated gains fell from about 2.2% at 64K to 0.4–1.2% at 128K, below a meaningful full-model threshold.
@@ -265,6 +294,7 @@ The fork-specific sequence is:
 - `2ba5970d` — batched speculative gathering;
 - `05b82c24` — query-private sparse verification segments;
 - `7c3b67b3` — shape-gated four-row q8_0 decode projection;
-- `28633d8c` — opt-in cooperative-matrix lightning-indexer batches for long-context speculative verification.
+- `28633d8c` — opt-in cooperative-matrix lightning-indexer batches for long-context speculative verification;
+- experimental q8_0 indexer-cache and block-local indexer/top-k fusion — retained opt-in, not production-promoted.
 
 The untouched non-sparse adaptive runtime remains a straightforward rollback target, and `GGML_VK_FA_TOPK_GATHER=0` provides a same-binary control.

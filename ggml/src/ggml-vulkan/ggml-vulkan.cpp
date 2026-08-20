@@ -1038,8 +1038,13 @@ struct vk_device_struct {
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_lightning_indexer_f16;
+    vk_pipeline pipeline_lightning_indexer_q8_0;
     vk_pipeline pipeline_lightning_indexer_cm_f16;
+    vk_pipeline pipeline_lightning_indexer_cm_q8_0;
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
+    vk_pipeline pipeline_lightning_indexer_decode_cm_q8_0;
+    vk_pipeline pipeline_lightning_indexer_topk_decode_cm_f16;
+    vk_pipeline pipeline_lightning_indexer_topk_decode_cm_q8_0;
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_q8_0;
@@ -1806,6 +1811,11 @@ struct vk_op_lightning_indexer_push_constants {
     uint32_t nbm1, nbm3;
 };
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
+
+struct vk_op_lightning_indexer_topk_push_constants : vk_op_lightning_indexer_push_constants {
+    uint32_t n_partial;
+};
+static_assert(sizeof(vk_op_lightning_indexer_topk_push_constants) <= 128);
 
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd, hc, nr;
@@ -6158,16 +6168,38 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5,
             sizeof(vk_op_lightning_indexer_push_constants), {8, 1, 1}, {device->subgroup_size}, 1, true, true,
             device->subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_q8_0,
+            "lightning_indexer_q8_0", lightning_indexer_q8_0_len, lightning_indexer_q8_0_data, "main", 5,
+            sizeof(vk_op_lightning_indexer_push_constants), {8, 1, 1}, {device->subgroup_size}, 1, true, true,
+            device->subgroup_size);
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (device->coopmat_support && device->coopmat_support_16x16x16_f32acc && device->subgroup_size_control) {
             ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
                 "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data, "main", 5,
                 sizeof(vk_op_lightning_indexer_push_constants), {16, 16, 1}, {device->subgroup_size}, 1, true, true,
                 device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_q8_0,
+                "lightning_indexer_cm_q8_0", lightning_indexer_cm_q8_0_len, lightning_indexer_cm_q8_0_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_push_constants), {16, 16, 1}, {device->subgroup_size}, 1, true, true,
+                device->subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16,
                 "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data, "main", 5,
                 sizeof(vk_op_lightning_indexer_push_constants), {16, 1, 1}, {device->subgroup_size}, 1, true, true,
                 device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_q8_0,
+                "lightning_indexer_decode_cm_q8_0", lightning_indexer_decode_cm_q8_0_len, lightning_indexer_decode_cm_q8_0_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_push_constants), {16, 1, 1}, {device->subgroup_size}, 1, true, true,
+                device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_topk_decode_cm_f16,
+                "lightning_indexer_topk_decode_cm_f16", lightning_indexer_topk_decode_cm_f16_len,
+                lightning_indexer_topk_decode_cm_f16_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_topk_push_constants), {1024, 1, 1}, {256, device->subgroup_size},
+                1, true, true, device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_topk_decode_cm_q8_0,
+                "lightning_indexer_topk_decode_cm_q8_0", lightning_indexer_topk_decode_cm_q8_0_len,
+                lightning_indexer_topk_decode_cm_q8_0_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_topk_push_constants), {1024, 1, 1}, {256, device->subgroup_size},
+                1, true, true, device->subgroup_size);
         }
 #endif
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_f16,
@@ -12443,14 +12475,23 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_LIGHTNING_INDEXER:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        if (src0->type == GGML_TYPE_F32 &&
+            (src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_Q8_0) && dst->type == GGML_TYPE_F32) {
+            const bool q8_k = src1->type == GGML_TYPE_Q8_0;
             const bool decode_cm_batch = src0->ne[2] == 1 ||
                 (src0->ne[2] >= 2 && src0->ne[2] <= ggml_vk_lightning_decode_cm_max_batch());
-            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && decode_cm_batch) {
-                return ctx->device->pipeline_lightning_indexer_decode_cm_f16;
+            vk_pipeline decode_cm = q8_k ? ctx->device->pipeline_lightning_indexer_decode_cm_q8_0
+                                         : ctx->device->pipeline_lightning_indexer_decode_cm_f16;
+            if (decode_cm && decode_cm_batch) {
+                return decode_cm;
             }
-            return ctx->device->pipeline_lightning_indexer_cm_f16 && src0->ne[2] >= 16 ?
-                ctx->device->pipeline_lightning_indexer_cm_f16 : ctx->device->pipeline_lightning_indexer_f16;
+            vk_pipeline cm = q8_k ? ctx->device->pipeline_lightning_indexer_cm_q8_0
+                                   : ctx->device->pipeline_lightning_indexer_cm_f16;
+            if (cm && src0->ne[2] >= 16) {
+                return cm;
+            }
+            return q8_k ? ctx->device->pipeline_lightning_indexer_q8_0
+                        : ctx->device->pipeline_lightning_indexer_f16;
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -13565,6 +13606,36 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         pc, { H, n_seqs, S_v });
 }
 
+static bool ggml_vk_can_fuse_lightning_indexer_topk(
+        ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_LIGHTNING_TOPK_FUSE");
+        return env && env[0] == '1';
+    }();
+    static const uint32_t min_kv = [] {
+        const char * env = getenv("GGML_VK_LIGHTNING_TOPK_MIN_KV");
+        return (uint32_t)std::max(2048, env ? atoi(env) : 32768);
+    }();
+    if (!enabled || node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * indexer = cgraph->nodes[node_idx];
+    const ggml_tensor * topk = cgraph->nodes[node_idx + 1];
+    if (indexer->op != GGML_OP_LIGHTNING_INDEXER || topk->op != GGML_OP_TOP_K ||
+        topk->src[0] != indexer || topk->type != GGML_TYPE_I32 ||
+        topk->ne[0] != 512 || indexer->ne[0] < min_kv ||
+        indexer->ne[1] < 1 || indexer->ne[1] > ggml_vk_lightning_decode_cm_max_batch() ||
+        !ggml_is_contiguous(indexer) || !ggml_is_contiguous(topk)) {
+        return false;
+    }
+
+    const ggml_tensor * k = indexer->src[1];
+    return k->type == GGML_TYPE_Q8_0 ? ctx->device->pipeline_lightning_indexer_topk_decode_cm_q8_0 != nullptr
+                                     : k->type == GGML_TYPE_F16 &&
+                                       ctx->device->pipeline_lightning_indexer_topk_decode_cm_f16 != nullptr;
+}
+
 static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -13585,8 +13656,8 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t) (q->nb[1] / sizeof(float)),
         (uint32_t) (q->nb[2] / sizeof(float)),
         (uint32_t) (q->nb[3] / sizeof(float)),
-        (uint32_t) (k->nb[2] / sizeof(ggml_fp16_t)),
-        (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (k->nb[2] / ggml_type_size(k->type)),
+        (uint32_t) (k->nb[3] / ggml_type_size(k->type)),
         (uint32_t) (w->nb[1] / sizeof(float)),
         (uint32_t) (w->nb[3] / sizeof(float)),
         (uint32_t) (m->nb[1] / sizeof(ggml_fp16_t)),
@@ -13598,6 +13669,118 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
          ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, m),
          ggml_vk_tensor_subbuffer(ctx, dst)},
         pc, {(uint32_t) k->ne[2], (uint32_t) q->ne[2], (uint32_t) q->ne[3]});
+}
+
+static void ggml_vk_lightning_indexer_topk(
+        ggml_backend_vk_context * ctx, vk_context & subctx,
+        ggml_tensor * indexer, ggml_tensor * topk) {
+    const ggml_tensor * q = indexer->src[0];
+    const ggml_tensor * k = indexer->src[1];
+    const ggml_tensor * w = indexer->src[2];
+    const ggml_tensor * m = indexer->src[3];
+
+    constexpr uint32_t block_keys = 1024;
+    constexpr uint32_t keep = 512;
+    const uint32_t n_kv = (uint32_t) k->ne[2];
+    const uint32_t n_batch = (uint32_t) q->ne[2];
+    const uint32_t n_stream = (uint32_t) q->ne[3];
+    const uint32_t n_rows = n_batch * n_stream;
+    const uint32_t n_blocks = CEIL_DIV(n_kv, block_keys);
+    const uint32_t n_partial = n_blocks * keep;
+
+    const size_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const size_t partial_size = ROUNDUP_POW2((size_t) n_partial * n_rows * sizeof(int32_t) * 2, align);
+    const uint32_t first_dst_elements = (n_partial / 1024) * keep + std::min(keep, n_partial % 1024);
+    const size_t merge_size = ROUNDUP_POW2((size_t) first_dst_elements * n_rows * sizeof(int32_t) * 2, align);
+    const size_t required = partial_size + 2 * merge_size;
+
+    if (ctx->prealloc_size_x < required) {
+        ctx->prealloc_size_x = required;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_pipeline pipeline = k->type == GGML_TYPE_Q8_0 ?
+        ctx->device->pipeline_lightning_indexer_topk_decode_cm_q8_0 :
+        ctx->device->pipeline_lightning_indexer_topk_decode_cm_f16;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_lightning_indexer_topk_push_constants pc = {};
+    pc.n_kv = n_kv;
+    pc.n_batch = n_batch;
+    pc.n_stream = n_stream;
+    pc.nem3 = (uint32_t) m->ne[3];
+    pc.nb1 = (uint32_t) (indexer->nb[1] / sizeof(float));
+    pc.nb3 = (uint32_t) (indexer->nb[3] / sizeof(float));
+    pc.nbq1 = (uint32_t) (q->nb[1] / sizeof(float));
+    pc.nbq2 = (uint32_t) (q->nb[2] / sizeof(float));
+    pc.nbq3 = (uint32_t) (q->nb[3] / sizeof(float));
+    pc.nbk2 = (uint32_t) (k->nb[2] / ggml_type_size(k->type));
+    pc.nbk3 = (uint32_t) (k->nb[3] / ggml_type_size(k->type));
+    pc.nbw1 = (uint32_t) (w->nb[1] / sizeof(float));
+    pc.nbw3 = (uint32_t) (w->nb[3] / sizeof(float));
+    pc.nbm1 = (uint32_t) (m->nb[1] / sizeof(ggml_fp16_t));
+    pc.nbm3 = (uint32_t) (m->nb[3] / sizeof(ggml_fp16_t));
+    pc.n_partial = n_partial;
+
+    const vk_subbuffer partial = { ctx->prealloc_x, 0, partial_size };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, k),
+         ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, m), partial},
+        pc, {n_kv, n_batch, n_stream});
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // Continue the existing TOP_K reduction from block-local (index, score) pairs.
+    // The fused indexer replaces only TOP_K's first pass; later passes and final
+    // destination ordering retain the established implementation.
+    uint32_t num_elements = n_partial;
+    uint32_t buf_index = 0;
+    bool first = true;
+    while (num_elements > keep) {
+        uint32_t max_pipeline = num_topk_pipelines - 1;
+        const uint32_t preferred = std::max(num_topk_pipelines - 3, (uint32_t)log2f(float(keep)) + 2);
+        max_pipeline = std::min(preferred, max_pipeline);
+        const uint32_t min_pipeline = std::max((uint32_t)log2f(float(keep)) + 1,
+                                               ctx->device->subgroup_size_log2);
+        uint32_t pipeline_idx = std::min((uint32_t)ceilf(log2f(float(num_elements))), max_pipeline);
+        pipeline_idx = std::max(pipeline_idx, min_pipeline);
+        if (num_elements > (1u << pipeline_idx)) {
+            for (uint32_t i = pipeline_idx; i < num_topk_pipelines; ++i) {
+                if (num_elements <= (1u << i)) {
+                    pipeline_idx = i;
+                    break;
+                }
+            }
+        }
+        vk_pipeline merge_pipeline = ctx->device->pipeline_topk_f32[pipeline_idx];
+        while (!merge_pipeline) {
+            pipeline_idx--;
+            GGML_ASSERT(pipeline_idx >= min_pipeline);
+            merge_pipeline = ctx->device->pipeline_topk_f32[pipeline_idx];
+        }
+
+        const uint32_t num_dst = (num_elements / merge_pipeline->wg_denoms[0]) * keep +
+                                 std::min(keep, num_elements % merge_pipeline->wg_denoms[0]);
+        vk_op_topk_push_constants topk_pc { n_kv, num_elements, num_dst, keep, n_rows, 0, num_dst == keep };
+        vk_subbuffer src = first ? partial :
+            vk_subbuffer { ctx->prealloc_x, partial_size + buf_index * merge_size, merge_size };
+        vk_subbuffer dst = num_dst == keep ? ggml_vk_tensor_subbuffer(ctx, topk) :
+            vk_subbuffer { ctx->prealloc_x, partial_size + (buf_index ^ 1) * merge_size, merge_size };
+
+        ggml_pipeline_request_descriptor_sets(ctx, merge_pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, merge_pipeline, {src, dst}, topk_pc,
+            {num_elements, std::min(n_rows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]), 1});
+        num_elements = num_dst;
+        buf_index ^= 1;
+        first = false;
+        if (num_elements > keep) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
+    ctx->prealloc_x_need_sync = true;
 }
 
 // DSv4 fused hyper-connection ops — ports of ggml-cuda/dsv4-hc.cu. Strides are passed in
@@ -16654,7 +16837,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_LIGHTNING_INDEXER:
-        ggml_vk_lightning_indexer(ctx, compute_ctx, node);
+        if (ctx->num_additional_fused_ops == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_TOP_K) {
+            ggml_vk_lightning_indexer_topk(ctx, compute_ctx, node, cgraph->nodes[node_idx + 1]);
+        } else {
+            ggml_vk_lightning_indexer(ctx, compute_ctx, node);
+        }
 
         break;
 
@@ -18210,6 +18397,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (ggml_can_fuse_subgraph(cgraph, i,
+                           { GGML_OP_LIGHTNING_INDEXER, GGML_OP_TOP_K }, { i + 1 }) &&
+                       ggml_vk_can_fuse_lightning_indexer_topk(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "LIGHTNING_INDEXER_TOP_K";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax_norm, { i + 3, i + 9 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_norm_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX_NORM)) {
@@ -19477,7 +19671,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 if (op->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 ||
-                    k->type != GGML_TYPE_F16 || w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16) {
+                    (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0) ||
+                    w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16) {
                     return false;
                 }
                 if (q->ne[0] != 128 || q->ne[1] != 64 || k->ne[0] != 128 || k->ne[1] != 1) {
@@ -19488,7 +19683,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     op->ne[0] != k->ne[2] || op->ne[1] != q->ne[2]) {
                     return false;
                 }
-                if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) ||
+                if (q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) ||
                     w->nb[0] != sizeof(float) || m->nb[0] != sizeof(ggml_fp16_t) ||
                     op->nb[0] != sizeof(float)) {
                     return false;
