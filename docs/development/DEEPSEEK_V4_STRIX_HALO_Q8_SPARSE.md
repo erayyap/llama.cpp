@@ -337,7 +337,7 @@ Several lossless-at-the-target speculative variants replaced the end of a five-t
 - an inline 4+1 graph that avoided a second dispatch;
 - an inline 4+1 path gated by the request-local acceptance EMA.
 
-The separate continuations were generally slower. Ungated inline 4+1 was mixed: a short coding run improved while arithmetic and prose regressed. The apparent coding gain did not survive a longer reasoning-aware comparison. DeepSeek emitted substantial `reasoning_content` even with `enable_thinking=false`, so the final comparison included those tokens and used enough budget for the coding answer to complete.
+The separate continuations were generally slower. Ungated inline 4+1 was initially mixed: a 192-token coding run improved while arithmetic and prose regressed. DeepSeek emitted substantial `reasoning_content` even with `enable_thinking=false`, so subsequent comparisons included those tokens and used enough output budget for every coding answer to complete.
 
 | Workload | EMA-gated 4+1 | Linear control | Delta |
 |---|---:|---:|---:|
@@ -346,7 +346,17 @@ The separate continuations were generally slower. Ungated inline 4+1 was mixed: 
 | Coding reasoning + answer | 26.15 tok/s | 26.67 tok/s | -1.96% |
 | Pigeonhole reasoning stream | 20.89 tok/s | 21.01 tok/s | -0.59% |
 
-Arithmetic, prose, and coding streams were identical between paths. The final reasoning case shared the same semantic prefix and diverged only at the maximum-token truncation boundary. A conservative EMA threshold never activated and was merely baseline behavior; a threshold that activated was neutral-to-slower overall. All Markov-tail graph/API/driver changes were removed.
+Arithmetic, prose, and coding streams were identical between paths. The final reasoning case shared the same semantic prefix and diverged only at the maximum-token truncation boundary. A conservative EMA threshold never activated and was merely baseline behavior; a threshold that activated was neutral-to-slower overall.
+
+The ungated inline 4+1 path was then retested directly with a 1,536-token budget. All three coding tasks reached their final answers. The planned ABBA was stopped after the first control/candidate pair because every candidate task showed a large regression:
+
+| Completed coding task | Ungated 4+1 | Linear control | Delta |
+|---|---:|---:|---:|
+| Generator-safe longest run | 23.17 tok/s | 25.61 tok/s | -9.52% |
+| O(1) LRU cache | 23.25 tok/s | 26.06 tok/s | -10.78% |
+| Normalized interval merge | 21.95 tok/s | 24.83 tok/s | -11.60% |
+
+Mean throughput changed by -10.63%, and draft acceptance fell on all three tasks. This establishes that the earlier truncated coding gain was not durable. All Markov-tail graph/API/driver changes were removed.
 
 Raw runs and JSON: `/home/canavar/benchmarks/dsv4-inference-research/campaign-1-2/`.
 
