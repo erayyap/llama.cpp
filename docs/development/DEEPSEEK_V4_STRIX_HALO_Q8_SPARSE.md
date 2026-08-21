@@ -428,6 +428,18 @@ A runtime experiment retained all six experts for the three hash-routed layers a
 
 Raw screens, ABBA, and quality logs: `/home/canavar/benchmarks/dsv4-inference-research/expert-topk-screen/`, `/home/canavar/benchmarks/dsv4-inference-research/expert-topk-abba/`, `/home/canavar/benchmarks/dsv4-inference-research/expert-topk5-abba/`, and `/home/canavar/benchmarks/dsv4-inference-research/expert-topk-quality/`.
 
+### Cross-layer lightning-indexer top-k reuse
+
+GLM-DSA can alias the preceding full layer's top-k in explicitly marked shared-indexer layers, but this DeepSeek V4 checkpoint has no equivalent metadata. A temporary callback measured the final-token top-k sets for every CSA layer after a fixed 32K prefill. Adjacent CSA layers had only 30.45% mean top-512 recall (14.26–52.34%). Oversizing the preceding layer's candidate set to 1024 and 2048 raised mean recall only to 42.07% and 57.22%; top-2048 still ranged from 34.57% to 89.26%. This is far below the 90% stop threshold, while consuming the oversized set would multiply sparse gather/attention work. Direct reuse was rejected and no graph or metadata change was retained.
+
+Raw logs and per-layer results: `/home/canavar/benchmarks/dsv4-inference-research/index-reuse/`.
+
+### Exact-shape IQ2/Q2_K Vulkan MMID audit
+
+Bounded operation cases now cover production verifier widths 2–5 for `IQ2_XXS m=2048,n_used=6,k=4096,n_mats=256` and `Q2_K m=4096,n_used=6,k=2048,n_mats=256`. The current cooperative-matrix path reached roughly 121–158 effective logical GB/s for IQ2_XXS and 178–227 GB/s for Q2_K. Integer-dot ABBA was mixed from 3.49% faster to 3.25% slower, with no consistent gain; disabling cooperative matrices was materially slower. Row-list bypass and broad tile selection were also neutral/mixed. No candidate approached the approximately 20% bounded-operation requirement, so MMID kernel changes were rejected while the exact regression cases were retained.
+
+Raw logs and summaries: `/home/canavar/benchmarks/dsv4-inference-research/mmid-exact-audit/`.
+
 ## Commits
 
 The fork-specific sequence is:
