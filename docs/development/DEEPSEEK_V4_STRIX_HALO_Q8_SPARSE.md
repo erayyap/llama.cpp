@@ -313,6 +313,43 @@ The exact DeepSeek V4 q8_0 projection shapes were screened with:
 
 The K16 variants passed CPU-reference checks for rows 1/2/4 across five representative shapes, but operation ABBA averaged +0.03%, +1.31%, and +0.30% latency respectively. Large workgroups were about 32% slower. Broad row coarsening showed only about a 1.1% isolated mean at best and had already failed to improve whole-model throughput in the preceding campaign. All new selector and shader code was removed; the previously validated `32768x1x1024` rows4 gate remains the only retained q8 decode coarsening.
 
+## Internet-inspired follow-up: exact indexer bounds and Markov tails
+
+Two additional ideas were implemented or bounded after surveying recent long-context and speculative-decoding work. Both were rejected and removed.
+
+### Exact lightning-indexer page bounds
+
+A Quest-inspired exact variant used per-page coordinate minima and maxima to upper-bound
+
+`sum_h weight_h * relu(dot(query_h, key))`.
+
+Unlike approximate page ranking, a page would be skipped only if its upper bound could not reach the current exact top-512 threshold. Synthetic screens covered 128-dimensional normalized keys, 64 query heads, page sizes 1–1,024, and autoregressive temporal correlations from 0 through 0.999.
+
+The dimensional box bound was too loose. Pages of four or more keys pruned nothing for correlations through 0.99. Even the deliberately extreme `rho=0.999` case pruned only 0.54% with four-key pages. Two-key pages pruned materially only at unrealistic extreme correlation, while computing page bounds plus exact scores for surviving pages required more work than the original cooperative-matrix scan. Page size one degenerates to the original exact score computation. No metadata cache or Vulkan selector was retained.
+
+Raw screen: `/home/canavar/benchmarks/dsv4-inference-research/campaign-1-2/exact-page-bound-screen.json`.
+
+### DSpark Markov-tail cascade
+
+Several lossless-at-the-target speculative variants replaced the end of a five-token DSpark block with pure Markov-head proposals:
+
+- separate 2+3, 3+2, and 4+1 continuation graphs;
+- an inline 4+1 graph that avoided a second dispatch;
+- an inline 4+1 path gated by the request-local acceptance EMA.
+
+The separate continuations were generally slower. Ungated inline 4+1 was mixed: a short coding run improved while arithmetic and prose regressed. The apparent coding gain did not survive a longer reasoning-aware comparison. DeepSeek emitted substantial `reasoning_content` even with `enable_thinking=false`, so the final comparison included those tokens and used enough budget for the coding answer to complete.
+
+| Workload | EMA-gated 4+1 | Linear control | Delta |
+|---|---:|---:|---:|
+| Arithmetic/reasoning stream | 28.40 tok/s | 28.54 tok/s | -0.50% |
+| Prose reasoning stream | 21.45 tok/s | 21.13 tok/s | +1.52% |
+| Coding reasoning + answer | 26.15 tok/s | 26.67 tok/s | -1.96% |
+| Pigeonhole reasoning stream | 20.89 tok/s | 21.01 tok/s | -0.59% |
+
+Arithmetic, prose, and coding streams were identical between paths. The final reasoning case shared the same semantic prefix and diverged only at the maximum-token truncation boundary. A conservative EMA threshold never activated and was merely baseline behavior; a threshold that activated was neutral-to-slower overall. All Markov-tail graph/API/driver changes were removed.
+
+Raw runs and JSON: `/home/canavar/benchmarks/dsv4-inference-research/campaign-1-2/`.
+
 ## Commits
 
 The fork-specific sequence is:
