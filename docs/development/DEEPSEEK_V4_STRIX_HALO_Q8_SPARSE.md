@@ -285,6 +285,34 @@ Two earlier follow-up experiments remained rejected:
 
 The production service remained inactive and disabled throughout testing.
 
+## General-TPS follow-up: rejected tree and packed GEMV candidates
+
+Two broader decode ideas were screened after the long-context campaign. Neither was retained.
+
+### DSpark two-branch tree
+
+A width-two DSpark prototype generated an ordinary Markov top-1 branch and a second branch taking the position-zero top-2 candidate, then continuing through its own Markov chain. The target and draft contexts reserved a second sequence and verified both branches together for deterministic requests.
+
+The prototype preserved the test output (`703` for `37*19`) but was substantially slower in a same-binary restart comparison:
+
+| Path | Decode | Draft acceptance |
+|---|---:|---:|
+| Linear adaptive DSpark | 28.13 tok/s | 39/47 |
+| Width-two tree | 14.98 tok/s | 36/48 |
+
+The tree was about 46.7% slower. DSpark already produces an entire block in one semi-autoregressive pass, so a second branch duplicated draft and target work without enough additional acceptance. Reserving a second non-unified sequence also halved the reported per-sequence context; preserving 409,600 tokens would require an unsafe doubled KV allocation or a more invasive unified-memory design. The prototype was fully removed.
+
+### Exact-shape q8_0 packed GEMV
+
+The exact DeepSeek V4 q8_0 projection shapes were screened with:
+
+- forced q8_1 integer-dot activation packing;
+- 256-thread reduction workgroups;
+- two-, four-, and eight-row output coarsening;
+- a K16 packed kernel consuming 16 q8 values per lane instead of eight.
+
+The K16 variants passed CPU-reference checks for rows 1/2/4 across five representative shapes, but operation ABBA averaged +0.03%, +1.31%, and +0.30% latency respectively. Large workgroups were about 32% slower. Broad row coarsening showed only about a 1.1% isolated mean at best and had already failed to improve whole-model throughput in the preceding campaign. All new selector and shader code was removed; the previously validated `32768x1x1024` rows4 gate remains the only retained q8 decode coarsening.
+
 ## Commits
 
 The fork-specific sequence is:
