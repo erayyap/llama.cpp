@@ -406,6 +406,28 @@ Repeated operation ABBA measured 21–32% lower latency at width two and 4.6–1
 
 Raw operation, layout, ABBA, and quality artifacts: `/home/canavar/benchmarks/dsv4-inference-research/grouped-woa/`.
 
+### Partial-target scout and DSpark confidence cutoff
+
+A 2,229-proposal corpus covering 618 reasoning, prose, coding, and logic verification blocks measured 70.66% draft-token acceptance. An oracle that knew the first rejected position could reduce submitted target positions by 22.97%, from mean width 4.61 to 3.55. That is not the realizable gain: a two-pass partial-target scout that reruns the full chosen prefix has linear layer-work ceilings of only 12.97%, 7.97%, 2.97%, and -2.03% at scout depths 4, 6, 8, and 10, before graph, cache, rollback, and output-head overhead.
+
+The current DeepSeek4 graph cannot stop and resume at an arbitrary layer. It is a static all-layer graph, and each layer mutates raw/SWA plus CSA/HCA/LID state. A resumable scout would require layer-range graph APIs and coordinated state continuation or expensive replay. Public lossless speculative-decoding methods likewise require complete target probabilities for submitted positions; an uncalibrated partial hidden state can safely select width but cannot replace final verification.
+
+The Q8 DSpark already includes a trained per-position confidence head exposed by `--spec-draft-p-min`, so it was evaluated as the zero-extra-target-compute alternative. Confidence predicted per-position acceptance well (AUC 0.846 across 463 blocks), but a corrected 0.40 cutoff improved pooled ABBA throughput by only 0.50%: arithmetic +0.96%, prose +0.79%, coding -0.27%. More aggressive 0.50/0.60 cutoffs regressed completed workloads. All instrumentation and controller experiments were removed; no partial-target implementation was retained.
+
+Raw acceptance, confidence, ABBA, external-research, and local-feasibility artifacts: `/home/canavar/benchmarks/dsv4-inference-research/partial-target-scout/`.
+
+### Multi-query `attn_q_b` rows4
+
+The retained rows4 projection cuts `q8_0 m=32768,n=1,k=1024` by roughly 45%. Reusing its already-generated width-specific pipelines for `n=2..5` passed CPU-reference correctness but was neutral: -0.11%, +0.14%, -0.08%, and -0.70% respectively. The generic multi-query path already amortizes the weight traffic, so the production selector remains width one only.
+
+Raw operation ABBA: `/home/canavar/benchmarks/dsv4-inference-research/qb-multiquery-rows4/`.
+
+### Semantic MoE expert pruning
+
+A runtime experiment retained all six experts for the three hash-routed layers and reduced learned-router layers from top six to top four or five. Top four produced a large 12.00% pooled ABBA gain, but failed the fixed arithmetic gate with `924` instead of `1901`; it was rejected immediately. Top five passed all 10/10 semantic short validators and long retrieval, and improved pooled ABBA by 5.00%, but prose regressed 6.19% and WikiText-2 512 perplexity degraded 5.84%, from 4.9479 to 5.2370. That is meaningful model-quality loss, so top five was also rejected. No expert-pruning code or runtime switch was retained.
+
+Raw screens, ABBA, and quality logs: `/home/canavar/benchmarks/dsv4-inference-research/expert-topk-screen/`, `/home/canavar/benchmarks/dsv4-inference-research/expert-topk-abba/`, `/home/canavar/benchmarks/dsv4-inference-research/expert-topk5-abba/`, and `/home/canavar/benchmarks/dsv4-inference-research/expert-topk-quality/`.
+
 ## Commits
 
 The fork-specific sequence is:
