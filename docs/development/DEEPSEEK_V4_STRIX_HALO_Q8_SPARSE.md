@@ -384,7 +384,7 @@ A metadata inspection and bounded `GGML_VK_PERF_LOGGER=1` run corrected an initi
 
 In a 58-token reasoning-aware decode, the shared vocabulary projection took 2.46–2.63 ms per graph, 52 calls and 129.89 ms total, or 4.49% of the 2,894.20 ms decode wall time. Therefore even a free perfect replacement is bounded near 4.5% on this workload. A real hierarchical shortlist would add lookup/scoring cost and could lower draft acceptance, so vocabulary pruning was deprioritized without implementation.
 
-For comparison, a representative target batch-three graph spent 21.80 ms in IQ2/Q2_K `MUL_MAT_ID`, 14.28 ms in the q8 expert batch-eight operation, 6.67 ms across forty `attn_q_b` projections, and 2.49 ms in the vocabulary head. This moves the next high-upside investigation toward route-coalesced MoE work.
+For comparison, a representative target batch-three graph spent 21.80 ms in IQ2/Q2_K `MUL_MAT_ID`, 14.28 ms in the eight-group q8 `attn_output_a` projection, 6.67 ms across forty `attn_q_b` projections, and 2.49 ms in the vocabulary head. The earlier “q8 expert batch-eight” label was incorrect: the `m=1024, k=4096, batch=8` shape is the grouped attention-output A projection.
 
 Raw profile and metadata: `/home/canavar/benchmarks/dsv4-inference-research/dspark-head-attribution/`.
 
@@ -395,6 +395,16 @@ A temporary eval callback captured all `ffn_moe_topk` tensors during a 160-token
 The opportunity is real but already implemented. `GGML_VK_MMID_ROWLISTS` is enabled by default and explicitly enabled by the package launcher. `mmid_row_lists.comp` builds per-expert offsets and packed token/slot entries, and `mul_mm_id_funcs.glsl` consumes each expert's grouped rows as a small-N tile. A second route-coalescing layer would duplicate the active path. Earlier MMID tile, direct active-expert dispatch, and row-list bypass experiments had already failed, so no new kernel was retained.
 
 Raw routes and parsed overlap: `/home/canavar/benchmarks/dsv4-inference-research/moe-route-overlap/`.
+
+### Grouped q8 attention-output projection
+
+The eight-group `attn_output_a` operation uses logical shape `m=1024, n=2..5, k=4096, batch=8`. A layout screen showed the generic batched path was 109–159% slower at widths two through five than a flat q8 matrix with the same total weight count. Generic q8 dequantization sharing and extending rows4 to this shape did not help.
+
+A dedicated shader now assigns one wave64 workgroup to each `(group, output row)`, vector-unpacks every q8_0 block once, and accumulates two or three query columns from that shared weight fragment. It is deliberately bypassed at widths four and five, where register pressure made it slower. `GGML_VK_Q8_GROUPED_WOA=1` enables the path and `=0` is the rollback.
+
+Repeated operation ABBA measured 21–32% lower latency at width two and 4.6–13.6% lower latency at width three. Focused CPU-reference checks passed for widths two and three. A three-workload whole-model ABBA improved mean decode throughput by 4.40%; the coding member was slightly negative while arithmetic and prose improved. The fixed short gate remained valid and byte-identical 10/10, 32K retrieval returned `ORCHID-7319`, and the deep gate passed 9/10 with the same archive-prefix arithmetic confound (`7319`) seen in prior candidates.
+
+Raw operation, layout, ABBA, and quality artifacts: `/home/canavar/benchmarks/dsv4-inference-research/grouped-woa/`.
 
 ## Commits
 
