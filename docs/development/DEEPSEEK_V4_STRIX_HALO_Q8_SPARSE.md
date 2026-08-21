@@ -378,6 +378,16 @@ Direct access became slightly faster only at batch eight, while the deployed DSp
 
 Raw ABBA logs: `/home/canavar/benchmarks/dsv4-inference-research/direct-indexed-attention/`.
 
+### Q8 hot-shape attribution and vocabulary-head bound
+
+A metadata inspection and bounded `GGML_VK_PERF_LOGGER=1` run corrected an initial hypothesis about the hot `m=32768, k=1024` q8_0 projection. It is `blk.<layer>.attn_q_b.weight`, not a DSpark vocabulary head. The Q8 DSpark file has three such tensors and no embedded vocabulary projection. Its decoder explicitly borrows the target model's `output.weight` through `ctx_other`; that tensor is Q8_0 with logical shape `129280 x 4096`.
+
+In a 58-token reasoning-aware decode, the shared vocabulary projection took 2.46–2.63 ms per graph, 52 calls and 129.89 ms total, or 4.49% of the 2,894.20 ms decode wall time. Therefore even a free perfect replacement is bounded near 4.5% on this workload. A real hierarchical shortlist would add lookup/scoring cost and could lower draft acceptance, so vocabulary pruning was deprioritized without implementation.
+
+For comparison, a representative target batch-three graph spent 21.80 ms in IQ2/Q2_K `MUL_MAT_ID`, 14.28 ms in the q8 expert batch-eight operation, 6.67 ms across forty `attn_q_b` projections, and 2.49 ms in the vocabulary head. This moves the next high-upside investigation toward route-coalesced MoE work.
+
+Raw profile and metadata: `/home/canavar/benchmarks/dsv4-inference-research/dspark-head-attribution/`.
+
 ## Commits
 
 The fork-specific sequence is:
