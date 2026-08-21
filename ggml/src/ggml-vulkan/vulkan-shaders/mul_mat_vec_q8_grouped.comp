@@ -1,0 +1,108 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint nrows;
+    uint nqueries;
+    uint ncols;
+    uint ngroups;
+    uint a_row_stride;
+    uint a_group_stride;
+    uint b_query_stride;
+    uint b_group_stride;
+    uint d_query_stride;
+    uint d_group_stride;
+} p;
+
+layout(binding = 0) readonly  buffer A  { block_q8_0          data_a[]; };
+layout(binding = 0) readonly  buffer A2 { block_q8_0_packed16 data_a2[]; };
+layout(binding = 1) readonly  buffer B  { float               data_b[]; };
+layout(binding = 1) readonly  buffer B4 { vec4                data_b4[]; };
+layout(binding = 2) writeonly buffer D  { float               data_d[]; };
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint group = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= p.nrows || group >= p.ngroups) {
+        return;
+    }
+
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    float acc2 = 0.0;
+    float acc3 = 0.0;
+    float acc4 = 0.0;
+
+    const uint blocks_per_row = p.ncols / 32;
+    const uint a_base = group * p.a_group_stride + row * p.a_row_stride;
+    const uint b_base = group * p.b_group_stride;
+
+    for (uint block = lane; block < blocks_per_row; block += 64) {
+        const uint a_idx = a_base + block;
+        const float scale = float(data_a[a_idx].d);
+        const uint col = block * 32;
+        float block0 = 0.0;
+        float block1 = 0.0;
+        float block2 = 0.0;
+        float block3 = 0.0;
+        float block4 = 0.0;
+        [[unroll]] for (uint i = 0; i < 32; i += 8) {
+            const i8vec2 q00 = unpack8(int32_t(data_a2[a_idx].qs[i / 2    ])).xy;
+            const i8vec2 q01 = unpack8(int32_t(data_a2[a_idx].qs[i / 2 + 1])).xy;
+            const i8vec2 q10 = unpack8(int32_t(data_a2[a_idx].qs[i / 2 + 2])).xy;
+            const i8vec2 q11 = unpack8(int32_t(data_a2[a_idx].qs[i / 2 + 3])).xy;
+            const vec4 q0 = vec4(q00.x, q00.y, q01.x, q01.y);
+            const vec4 q1 = vec4(q10.x, q10.y, q11.x, q11.y);
+            const uint b0 = b_base + col + i;
+            block0 += dot(q0, data_b4[b0 / 4]) + dot(q1, data_b4[b0 / 4 + 1]);
+            if (p.nqueries > 1) {
+                const uint bj = b0 + p.b_query_stride;
+                block1 += dot(q0, data_b4[bj / 4]) + dot(q1, data_b4[bj / 4 + 1]);
+            }
+            if (p.nqueries > 2) {
+                const uint bj = b0 + 2 * p.b_query_stride;
+                block2 += dot(q0, data_b4[bj / 4]) + dot(q1, data_b4[bj / 4 + 1]);
+            }
+            if (p.nqueries > 3) {
+                const uint bj = b0 + 3 * p.b_query_stride;
+                block3 += dot(q0, data_b4[bj / 4]) + dot(q1, data_b4[bj / 4 + 1]);
+            }
+            if (p.nqueries > 4) {
+                const uint bj = b0 + 4 * p.b_query_stride;
+                block4 += dot(q0, data_b4[bj / 4]) + dot(q1, data_b4[bj / 4 + 1]);
+            }
+        }
+        acc0 = fma(scale, block0, acc0);
+        acc1 = fma(scale, block1, acc1);
+        acc2 = fma(scale, block2, acc2);
+        acc3 = fma(scale, block3, acc3);
+        acc4 = fma(scale, block4, acc4);
+    }
+
+    acc0 = subgroupAdd(acc0);
+    acc1 = subgroupAdd(acc1);
+    acc2 = subgroupAdd(acc2);
+    acc3 = subgroupAdd(acc3);
+    acc4 = subgroupAdd(acc4);
+
+    if (lane == 0) {
+        const uint d_base = group * p.d_group_stride + row;
+        data_d[d_base] = acc0;
+        if (p.nqueries > 1) data_d[d_base +     p.d_query_stride] = acc1;
+        if (p.nqueries > 2) data_d[d_base + 2 * p.d_query_stride] = acc2;
+        if (p.nqueries > 3) data_d[d_base + 3 * p.d_query_stride] = acc3;
+        if (p.nqueries > 4) data_d[d_base + 4 * p.d_query_stride] = acc4;
+    }
+}

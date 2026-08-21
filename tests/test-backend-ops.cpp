@@ -9967,6 +9967,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(2));
 #endif
 
+    // DeepSeek V4 grouped attention-output projection: eight independent
+    // q8_0 matrices, exercised at the speculative verification widths.
+    for (int n : { 1, 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}));
+    }
+
     // lightning_indexer
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
@@ -10029,10 +10036,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // DeepSeek V4 single-token decode shapes. These provide bounded A/B
-    // coverage for q8_0 dequantize-matvec tuning.
+    // DeepSeek V4 decode shapes. These provide bounded A/B coverage for
+    // q8_0 dequantize-matvec tuning, including the grouped attention output.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   4096, 1, 8192, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   1024, 1, 4096, {8, 1}, {1, 1}));
+    for (int n : { 1, 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  32768, 1, 1024, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   2048, 1, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   1024, 1, 4096, {1, 1}, {1, 1}));

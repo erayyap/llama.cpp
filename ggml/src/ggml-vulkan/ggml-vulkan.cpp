@@ -885,6 +885,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_rows4_f32[mul_mat_vec_max_cols];
+    vk_pipeline pipeline_mul_mat_vec_q8_grouped;
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
@@ -1266,6 +1267,19 @@ struct vk_mat_mat_id_push_constants {
     uint32_t use_row_lists;
     uint32_t fusion_flags;
 };
+struct vk_mat_vec_q8_grouped_push_constants {
+    uint32_t nrows;
+    uint32_t nqueries;
+    uint32_t ncols;
+    uint32_t ngroups;
+    uint32_t a_row_stride;
+    uint32_t a_group_stride;
+    uint32_t b_query_stride;
+    uint32_t b_group_stride;
+    uint32_t d_query_stride;
+    uint32_t d_group_stride;
+};
+
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -5631,6 +5645,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             sizeof(vk_mat_vec_push_constants), {4, 1, 1}, {subgroup_size, 4, i + 1}, 1, true,
             use_subgroups, force_subgroup_size);
     }
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_q8_grouped,
+        "mul_mat_vec_q8_grouped", mul_mat_vec_q8_grouped_len, mul_mat_vec_q8_grouped_data, "main", 3,
+        sizeof(vk_mat_vec_q8_grouped_push_constants), {1, 1, 1}, {64, 1, 1}, 1, true, true, 64);
 
 #undef OCP_DMMV_DATA
 #undef OCP_DMMV_LEN
@@ -9474,7 +9491,47 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
+static bool ggml_vk_mul_mat_vec_q8_grouped(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_Q8_GROUPED_WOA");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || !ctx->device->pipeline_mul_mat_vec_q8_grouped ||
+        src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[0] != 4096 || src0->ne[1] != 1024 || src0->ne[2] != 8 || src0->ne[3] != 1 ||
+        src1->ne[0] != 4096 || src1->ne[1] < 2 || src1->ne[1] > 3 || src1->ne[2] != 8 || src1->ne[3] != 1 ||
+        dst->ne[0] != 1024 || dst->ne[1] != src1->ne[1] || dst->ne[2] != 8 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const size_t q8_size = ggml_type_size(GGML_TYPE_Q8_0);
+    const vk_mat_vec_q8_grouped_push_constants pc = {
+        (uint32_t) src0->ne[1],
+        (uint32_t) src1->ne[1],
+        (uint32_t) src0->ne[0],
+        (uint32_t) src0->ne[2],
+        (uint32_t) (src0->nb[1] / q8_size),
+        (uint32_t) (src0->nb[2] / q8_size),
+        (uint32_t) (src1->nb[1] / sizeof(float)),
+        (uint32_t) (src1->nb[2] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[2] / sizeof(float)),
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_q8_grouped;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {(uint32_t) src0->ne[1], (uint32_t) src0->ne[2], 1});
+    return true;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+    if (ggml_vk_mul_mat_vec_q8_grouped(ctx, subctx, src0, src1, dst)) {
+        return;
+    }
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
