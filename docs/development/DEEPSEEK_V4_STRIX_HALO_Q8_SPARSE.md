@@ -388,6 +388,14 @@ For comparison, a representative target batch-three graph spent 21.80 ms in IQ2/
 
 Raw profile and metadata: `/home/canavar/benchmarks/dsv4-inference-research/dspark-head-attribution/`.
 
+### MoE route-overlap attribution
+
+A temporary eval callback captured all `ffn_moe_topk` tensors during a 160-token reasoning-aware run: 3,027 layer routes across 66 target graphs and 63 three-layer draft graphs. Each token selected six of 256 experts. Target duplicate-assignment reduction from grouping was 25.58% at batch two, 25.69% at batch three, 33.39% at batch four, and 39.15% at batch five. Typical token pairs shared about two of six experts.
+
+The opportunity is real but already implemented. `GGML_VK_MMID_ROWLISTS` is enabled by default and explicitly enabled by the package launcher. `mmid_row_lists.comp` builds per-expert offsets and packed token/slot entries, and `mul_mm_id_funcs.glsl` consumes each expert's grouped rows as a small-N tile. A second route-coalescing layer would duplicate the active path. Earlier MMID tile, direct active-expert dispatch, and row-list bypass experiments had already failed, so no new kernel was retained.
+
+Raw routes and parsed overlap: `/home/canavar/benchmarks/dsv4-inference-research/moe-route-overlap/`.
+
 ## Commits
 
 The fork-specific sequence is:
