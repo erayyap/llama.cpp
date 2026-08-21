@@ -13196,6 +13196,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (decode_cm && decode_cm_batch) {
                 return decode_cm;
             }
+            static const char * small_cm_env = getenv("GGML_VK_LIGHTNING_INDEXER_SMALL_CM");
+            if (!q8_k && src0->ne[2] > 1 && src0->ne[2] < 16 &&
+                small_cm_env && small_cm_env[0] == '1') {
+                return ctx->device->pipeline_lightning_indexer_cm_small_f16;
+            }
             vk_pipeline cm = q8_k ? ctx->device->pipeline_lightning_indexer_cm_q8_0
                                    : (ctx->device->pipeline_lightning_indexer_cm_f16 ?
                                       ctx->device->pipeline_lightning_indexer_cm_f16 :
