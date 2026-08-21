@@ -360,6 +360,24 @@ Mean throughput changed by -10.63%, and draft acceptance fell on all three tasks
 
 Raw runs and JSON: `/home/canavar/benchmarks/dsv4-inference-research/campaign-1-2/`.
 
+### Direct indexed sparse attention
+
+A follow-up attempted to remove the compact f16 scratch entirely. The existing direct f16 top-k shader was enabled for decode batches, then extended with a q8_0 variant that loads each selected q8 tile once, dequantizes it into LDS, and shares it across eight query heads. Key tiles of 8, 16, and 32 and four-head/256-thread versus eight-head/512-thread workgroups were screened.
+
+Correctness passed the focused f16 case and all 7/7 q8 cases, including sinks, batches 1/2/3/5/6/8, and a two-stream batch. Performance did not justify retaining it. At 32,768 compressed rows:
+
+| Query batch | Compact q8 gather | Direct q8 | Direct delta |
+|---:|---:|---:|---:|
+| 1 | 75.07 us | 403.71 us | +437.81% |
+| 2 | 155.56 us | 445.82 us | +186.60% |
+| 3 | 265.77 us | 488.32 us | +83.74% |
+| 5 | 501.61 us | 576.14 us | +14.86% |
+| 8 | 855.64 us | 820.69 us | -4.09% |
+
+Direct access became slightly faster only at batch eight, while the deployed DSpark model is limited to five proposals by `dflash.block_size=5`. The gather path wins every production batch because dequantize-once scratch creation is cheap and the ordinary dense FA kernels exploit small batches much better than the barrier-heavy direct shader. The direct pipelines, selector, and test expansion were removed.
+
+Raw ABBA logs: `/home/canavar/benchmarks/dsv4-inference-research/direct-indexed-attention/`.
+
 ## Commits
 
 The fork-specific sequence is:
