@@ -156,6 +156,44 @@ int main() {
         common_speculative_accept(spec.get(), 0, 12);
     }
 
+    {
+        setenv("LLAMA_NGRAM_STAGED_GATE", "5", 1);
+
+        common_params_speculative params;
+        params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MOD, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        params.ngram_mod.n_match = config.n_match;
+        params.ngram_mod.n_min = config.n_min;
+        params.ngram_mod.n_max = config.n_max;
+        common_speculative_ptr spec(common_speculative_init(params, 1));
+
+        auto prompt = reliable_prompt(source);
+        tokens draft;
+        common_speculative_begin(spec.get(), 0, prompt);
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, 64, (llama_pos) prompt.size(), source[23], &prompt, &draft,
+        };
+        common_speculative_draft(spec.get());
+        require(draft.size() == 5);
+        for (size_t i = 0; i < draft.size(); ++i) {
+            require(draft[i] == source[24 + i]);
+        }
+        common_speculative_accept(spec.get(), 0, 5);
+
+        prompt.push_back(source[23]);
+        prompt.insert(prompt.end(), draft.begin(), draft.end());
+        draft.clear();
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, 64, (llama_pos) prompt.size(), source[29], &prompt, &draft,
+        };
+        common_speculative_draft(spec.get());
+        require(draft.size() == 42);
+        require(draft.front() == source[30]);
+        require(draft.back() == source[71]);
+        common_speculative_accept(spec.get(), 0, 42);
+
+        unsetenv("LLAMA_NGRAM_STAGED_GATE");
+    }
+
     std::cout << "adaptive ngram router tests passed\n";
     return 0;
 }

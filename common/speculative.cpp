@@ -1906,6 +1906,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     const bool adaptive;
     std::vector<common_ngram_mod_router> routers;
 
+    // Optional two-stage verification: first verify a small gate with the mature
+    // DSpark-width path, then submit the remainder only after the gate and the
+    // target-sampled boundary token match the n-gram continuation.
+    int32_t staged_gate = 0;
+
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
@@ -1918,6 +1923,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // Adaptive n-gram staged-verification state.
+        // phase: 0 = none, 1 = gate verifying, 2 = gate passed/await boundary,
+        //        3 = continuation verifying.
+        int stage_phase = 0;
+        size_t gate_width = 0;
+        llama_tokens staged_candidate;
     };
 
     std::vector<seq_info> sinfos;
@@ -1937,6 +1949,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 this->params.n_match, this->params.n_max, this->params.n_min, adaptive);
         SPC_TRC("- mod size=%zu (%.3f MB)\n",
                 mod.size(), (float)(mod.size_bytes())/1024/1024);
+
+        if (const char * env = std::getenv("LLAMA_NGRAM_STAGED_GATE")) {
+            staged_gate = std::max(0, std::atoi(env));
+        }
+        if (adaptive && staged_gate > 0) {
+            SPC_TRC("- staged verification gate=%d\n", staged_gate);
+        }
 
         if (this->params.n_match < 16) {
             SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
@@ -1961,6 +1980,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
         sinfo.n_low = 0;
+        sinfo.stage_phase = 0;
+        sinfo.gate_width = 0;
+        sinfo.staged_candidate.clear();
 
         if (adaptive) {
             routers[seq_id].begin(prompt);
@@ -2000,12 +2022,44 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.n_draft_last = 0;
 
         if (adaptive) {
+            if (sinfo.stage_phase == 2) {
+                const size_t boundary = sinfo.gate_width;
+                const size_t remainder_beg = boundary + 1; // boundary token was sampled by the target
+                const size_t remainder = sinfo.staged_candidate.size() - remainder_beg;
+
+                if (boundary < sinfo.staged_candidate.size() &&
+                        dparams.id_last == sinfo.staged_candidate[boundary] &&
+                        remainder > 0 && dparams.n_max >= (int32_t) remainder) {
+                    result.assign(
+                            sinfo.staged_candidate.begin() + remainder_beg,
+                            sinfo.staged_candidate.end());
+                    sinfo.stage_phase = 3;
+                    sinfo.n_draft_last = result.size();
+                    SPC_DBG("ngram staged continuation seq=%d gate=%zu remainder=%zu\n",
+                            seq_id, sinfo.gate_width, remainder);
+                    return;
+                }
+
+                // The target boundary disagreed or the remainder no longer fits. Resolve the
+                // router's pending trial as the accepted gate only and fall back to DSpark.
+                routers[seq_id].accept((int32_t) sinfo.gate_width);
+                sinfo.stage_phase = 0;
+                sinfo.gate_width = 0;
+                sinfo.staged_candidate.clear();
+            }
+
             const auto route = routers[seq_id].draft(prompt, dparams.id_last, dparams.n_max, result);
+            if (route.selected && staged_gate > 0 && result.size() > (size_t) staged_gate) {
+                sinfo.staged_candidate = result;
+                sinfo.gate_width = std::min((size_t) staged_gate, result.size());
+                result.resize(sinfo.gate_width);
+                sinfo.stage_phase = 1;
+            }
             sinfo.n_draft_last = result.size();
             if (route.selected) {
-                SPC_DBG("ngram route seq=%d width=%d threshold=%d occurrences=%d agreement=%d copy_run=%d source=%s\n",
-                        seq_id, route.width, route.threshold, route.occurrences, route.agreement,
-                        route.copy_run, route.from_prompt ? "prompt" : "generated");
+                SPC_DBG("ngram route seq=%d width=%d staged=%d threshold=%d occurrences=%d agreement=%d copy_run=%d source=%s\n",
+                        seq_id, route.width, sinfo.stage_phase == 1, route.threshold, route.occurrences,
+                        route.agreement, route.copy_run, route.from_prompt ? "prompt" : "generated");
             }
             return;
         }
@@ -2082,6 +2136,28 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         auto & sinfo = sinfos[seq_id];
 
         if (adaptive) {
+            if (sinfo.stage_phase == 1) {
+                if (n_accepted == sinfo.gate_width) {
+                    sinfo.stage_phase = 2;
+                } else {
+                    routers[seq_id].accept(n_accepted);
+                    sinfo.stage_phase = 0;
+                    sinfo.gate_width = 0;
+                    sinfo.staged_candidate.clear();
+                }
+                return;
+            }
+
+            if (sinfo.stage_phase == 3) {
+                // Include the accepted gate and the matching target-sampled boundary token
+                // when updating the router's profitability/cooldown state.
+                routers[seq_id].accept((int32_t) (sinfo.gate_width + 1 + n_accepted));
+                sinfo.stage_phase = 0;
+                sinfo.gate_width = 0;
+                sinfo.staged_candidate.clear();
+                return;
+            }
+
             routers[seq_id].accept(n_accepted);
             return;
         }
