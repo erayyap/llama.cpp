@@ -198,6 +198,11 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // Packed-tree verification records the physical rows for its temporary
+    // branch nodes. Commit retains only root + accepted path metadata.
+    void record_tree_slots(const slot_info & sinfo, const llama_ubatch & ubatch);
+    bool tree_commit(llama_seq_id seq_id, const std::vector<int32_t> & keep_batch_idxs);
+
     //
     // input API
     //
@@ -285,6 +290,8 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    std::vector<uint32_t> tree_slot_idxs;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

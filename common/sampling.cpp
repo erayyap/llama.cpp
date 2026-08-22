@@ -685,6 +685,56 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
+common_sampler_tree_result common_sampler_sample_and_accept_tree(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int32_t root_idx,
+        const std::vector<int32_t> & node_idxs,
+        const llama_tokens & node_tokens,
+        const std::vector<int32_t> & node_parents,
+        bool grammar_first) {
+    GGML_ASSERT(node_idxs.size() == node_tokens.size());
+    GGML_ASSERT(node_idxs.size() == node_parents.size());
+
+    common_sampler_tree_result result;
+    int32_t parent = -1;
+    int32_t logits_idx = root_idx;
+
+    while (true) {
+        const llama_token sampled = common_sampler_sample(gsmpl, ctx, logits_idx, grammar_first);
+        common_sampler_accept(gsmpl, sampled, true);
+        result.tokens.push_back(sampled);
+
+        int32_t matched = -1;
+        for (int32_t i = 0; i < (int32_t) node_tokens.size(); ++i) {
+            if (node_parents[i] == parent && node_tokens[i] == sampled) {
+                matched = i;
+                break;
+            }
+        }
+        if (matched < 0) {
+            break;
+        }
+
+        result.path.push_back(matched);
+        parent = matched;
+        logits_idx = node_idxs[matched];
+
+        bool has_child = false;
+        for (int32_t p : node_parents) {
+            has_child |= p == parent;
+        }
+        if (!has_child) {
+            const llama_token bonus = common_sampler_sample(gsmpl, ctx, logits_idx, grammar_first);
+            common_sampler_accept(gsmpl, bonus, true);
+            result.tokens.push_back(bonus);
+            break;
+        }
+    }
+
+    return result;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {

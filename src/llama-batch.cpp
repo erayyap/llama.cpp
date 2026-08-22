@@ -224,6 +224,7 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.tree_parent  =*/ batch.tree_parent,
             /*.data         =*/ {},
         };
 
@@ -408,6 +409,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->tree_parent.resize(n_tokens, -1);
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         udata->seq_idx[s] = s;
@@ -430,6 +432,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.tree_parent  =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -764,6 +767,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->tree_parent.resize(n_tokens, -1);
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -789,6 +793,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
+        udata->tree_parent[i] = batch.tree_parent ? batch.tree_parent[idxs[i]] : -1;
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -831,6 +836,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.tree_parent  =*/ batch.tree_parent ? udata->tree_parent.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -939,6 +945,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*tree_parent =*/ nullptr,
     };
 }
 
@@ -951,6 +958,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*tree_parent =*/ nullptr,
     };
 
     if (embd) {

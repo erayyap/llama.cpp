@@ -151,6 +151,7 @@ public:
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    bool tree_commit(llama_seq_id seq_id, const std::vector<int32_t> & keep_batch_idxs);
 
 private:
     llama_hparams hparams_raw;

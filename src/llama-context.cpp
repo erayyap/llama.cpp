@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1200,6 +1201,198 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+bool llama_context::dspark_markov_score(const llama_token * parents, int32_t n_parents, float * out) {
+    if (!parents || !out || n_parents <= 0 || !model.dspark_markov_w1 || !model.dspark_markov_w2) {
+        return false;
+    }
+
+    if (!sched_dspark_markov) {
+        sched_dspark_markov.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                512, false, cparams.op_offload));
+        if (!sched_dspark_markov) {
+            return false;
+        }
+    }
+
+    constexpr size_t meta_size = 256 * 1024;
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params iparams = {
+        /*.mem_size   =*/ meta.size(),
+        /*.mem_buffer =*/ meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(iparams));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * inp = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_parents);
+    ggml_set_name(inp, "pctree_parents");
+    ggml_set_input(inp);
+
+    ggml_tensor * rows = ggml_get_rows(ctx.get(), model.dspark_markov_w1, inp);
+    ggml_tensor * bias = ggml_mul_mat(ctx.get(), model.dspark_markov_w2, rows);
+    ggml_set_name(bias, "pctree_markov_bias");
+    ggml_set_output(bias);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 64, false);
+    ggml_build_forward_expand(gf, bias);
+
+    auto * aux = sched_dspark_markov.get();
+    ggml_backend_sched_reset(aux);
+    ggml_backend_sched_set_tensor_backend(aux, inp, backend_cpu);
+    if (!ggml_backend_sched_alloc_graph(aux, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate PCTree Markov graph\n", __func__);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, parents, 0, (size_t) n_parents * sizeof(llama_token));
+    if (ggml_backend_sched_graph_compute(aux, gf) != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: PCTree Markov graph compute failed\n", __func__);
+        return false;
+    }
+    ggml_backend_sched_synchronize(aux);
+    ggml_backend_tensor_get(bias, out, 0, ggml_nbytes(bias));
+    return true;
+}
+
+bool llama_context::dspark_pctree_build(
+        const float * refined_logits,
+        const llama_token * greedy_parents,
+        int32_t n_depth,
+        int32_t k,
+        std::vector<llama_dspark_pctree_level> & levels) {
+    levels.clear();
+    if (!refined_logits || !greedy_parents || n_depth <= 0 || k <= 0 || k > 4 ||
+            !model.dspark_markov_w1 || !model.dspark_markov_w2) {
+        return false;
+    }
+
+    if (!sched_dspark_markov) {
+        sched_dspark_markov.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                512, false, cparams.op_offload));
+        if (!sched_dspark_markov) {
+            return false;
+        }
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    constexpr size_t meta_size = 2 * 1024 * 1024;
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params iparams = {
+        /*.mem_size   =*/ meta.size(),
+        /*.mem_buffer =*/ meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(iparams));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * inp_refined = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_vocab, n_depth);
+    ggml_set_name(inp_refined, "pctree_refined_logits");
+    ggml_set_input(inp_refined);
+    ggml_tensor * inp_greedy = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_depth);
+    ggml_set_name(inp_greedy, "pctree_greedy_parents");
+    ggml_set_input(inp_greedy);
+    ggml_tensor * inp_root_prob = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+    ggml_set_name(inp_root_prob, "pctree_root_prob");
+    ggml_set_input(inp_root_prob);
+
+    ggml_tensor * greedy_rows = ggml_get_rows(ctx.get(), model.dspark_markov_w1, inp_greedy);
+    ggml_tensor * greedy_bias = ggml_mul_mat(ctx.get(), model.dspark_markov_w2, greedy_rows);
+    ggml_tensor * base_logits = ggml_sub(ctx.get(), inp_refined, greedy_bias);
+
+    ggml_tensor * frontier_tokens = ggml_view_1d(ctx.get(), inp_greedy, 1, 0);
+    ggml_tensor * frontier_probs  = inp_root_prob;
+
+    struct level_tensors {
+        ggml_tensor * candidates;
+        ggml_tensor * probs;
+        ggml_tensor * selected;
+    };
+    std::vector<level_tensors> level_outputs;
+    level_outputs.reserve(n_depth);
+
+    for (int32_t depth = 0; depth < n_depth; ++depth) {
+        const int64_t n_parents = depth == 0 ? 1 : k;
+        ggml_tensor * parent_rows = ggml_get_rows(ctx.get(), model.dspark_markov_w1, frontier_tokens);
+        ggml_tensor * parent_bias = ggml_mul_mat(ctx.get(), model.dspark_markov_w2, parent_rows);
+        ggml_tensor * base_col = ggml_view_2d(ctx.get(), base_logits, n_vocab, 1,
+                base_logits->nb[1], (size_t) depth * base_logits->nb[1]);
+        ggml_tensor * logits = ggml_add(ctx.get(), ggml_repeat(ctx.get(), base_col, parent_bias), parent_bias);
+        ggml_tensor * probs = ggml_soft_max(ctx.get(), logits);
+        ggml_tensor * top_ids = ggml_top_k(ctx.get(), probs, k);
+
+        ggml_tensor * candidate_tokens = nullptr;
+        ggml_tensor * candidate_probs = nullptr;
+        for (int64_t p = 0; p < n_parents; ++p) {
+            ggml_tensor * ids_p = ggml_view_1d(ctx.get(), top_ids, k, (size_t) p * top_ids->nb[1]);
+            ggml_tensor * probs_p = ggml_view_1d(ctx.get(), probs, n_vocab, (size_t) p * probs->nb[1]);
+            probs_p = ggml_reshape_2d(ctx.get(), probs_p, 1, n_vocab);
+            ggml_tensor * vals_p = ggml_get_rows(ctx.get(), probs_p, ids_p);
+            vals_p = ggml_reshape_1d(ctx.get(), vals_p, k);
+            ggml_tensor * parent_p = ggml_view_1d(ctx.get(), frontier_probs, 1, (size_t) p * frontier_probs->nb[0]);
+            vals_p = ggml_mul(ctx.get(), vals_p, ggml_repeat(ctx.get(), parent_p, vals_p));
+            candidate_tokens = candidate_tokens ? ggml_concat(ctx.get(), candidate_tokens, ids_p, 0) : ids_p;
+            candidate_probs  = candidate_probs  ? ggml_concat(ctx.get(), candidate_probs,  vals_p, 0) : vals_p;
+        }
+
+        ggml_tensor * selected = ggml_top_k(ctx.get(), candidate_probs, std::min<int32_t>(k, candidate_probs->ne[0]));
+        ggml_tensor * token_rows = ggml_reshape_2d(ctx.get(), candidate_tokens, 1, candidate_tokens->ne[0]);
+        ggml_tensor * prob_rows  = ggml_reshape_2d(ctx.get(), candidate_probs,  1, candidate_probs->ne[0]);
+        frontier_tokens = ggml_reshape_1d(ctx.get(), ggml_get_rows(ctx.get(), token_rows, selected), selected->ne[0]);
+        frontier_probs  = ggml_reshape_1d(ctx.get(), ggml_get_rows(ctx.get(), prob_rows,  selected), selected->ne[0]);
+
+        ggml_set_output(candidate_tokens);
+        ggml_set_output(candidate_probs);
+        ggml_set_output(selected);
+        level_outputs.push_back({ candidate_tokens, candidate_probs, selected });
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 512, false);
+    for (const auto & out : level_outputs) {
+        ggml_build_forward_expand(gf, out.candidates);
+        ggml_build_forward_expand(gf, out.probs);
+        ggml_build_forward_expand(gf, out.selected);
+    }
+
+    auto * aux = sched_dspark_markov.get();
+    ggml_backend_sched_reset(aux);
+    ggml_backend_sched_set_tensor_backend(aux, inp_refined, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(aux, inp_greedy, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(aux, inp_root_prob, backend_cpu);
+    if (!ggml_backend_sched_alloc_graph(aux, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate PCTree graph\n", __func__);
+        return false;
+    }
+
+    const float root_prob = 1.0f;
+    ggml_backend_tensor_set(inp_refined, refined_logits, 0, (size_t) n_vocab * n_depth * sizeof(float));
+    ggml_backend_tensor_set(inp_greedy, greedy_parents, 0, (size_t) n_depth * sizeof(llama_token));
+    ggml_backend_tensor_set(inp_root_prob, &root_prob, 0, sizeof(root_prob));
+    if (ggml_backend_sched_graph_compute(aux, gf) != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: PCTree graph compute failed\n", __func__);
+        return false;
+    }
+    ggml_backend_sched_synchronize(aux);
+
+    levels.resize(n_depth);
+    for (int32_t depth = 0; depth < n_depth; ++depth) {
+        const auto & tensors = level_outputs[depth];
+        auto & level = levels[depth];
+        level.candidates.resize(ggml_nelements(tensors.candidates));
+        level.candidate_probs.resize(ggml_nelements(tensors.probs));
+        level.selected.resize(ggml_nelements(tensors.selected));
+        ggml_backend_tensor_get(tensors.candidates, level.candidates.data(), 0, ggml_nbytes(tensors.candidates));
+        ggml_backend_tensor_get(tensors.probs, level.candidate_probs.data(), 0, ggml_nbytes(tensors.probs));
+        ggml_backend_tensor_get(tensors.selected, level.selected.data(), 0, ggml_nbytes(tensors.selected));
+    }
+    return true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -3824,6 +4017,39 @@ uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+}
+
+bool llama_dspark_markov_score(
+        struct llama_context * ctx,
+        const llama_token * parents,
+        int32_t n_parents,
+        float * out) {
+    return ctx && ctx->dspark_markov_score(parents, n_parents, out);
+}
+
+bool llama_dspark_pctree_build(
+        struct llama_context * ctx,
+        const float * refined_logits,
+        const llama_token * greedy_parents,
+        int32_t n_depth,
+        int32_t k,
+        std::vector<llama_dspark_pctree_level> & levels) {
+    return ctx && ctx->dspark_pctree_build(refined_logits, greedy_parents, n_depth, k, levels);
+}
+
+bool llama_dsv4_tree_commit(
+        struct llama_context * ctx,
+        llama_seq_id seq_id,
+        const int32_t * keep_batch_idxs,
+        int32_t n_keep) {
+    if (!ctx || !keep_batch_idxs || n_keep <= 0) {
+        return false;
+    }
+    auto * memory = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
+    if (!memory) {
+        return false;
+    }
+    return memory->tree_commit(seq_id, { keep_batch_idxs, keep_batch_idxs + n_keep });
 }
 
 struct ggml_cgraph * llama_graph_reserve(

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -164,6 +165,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.tree_parent  =*/ nullptr,
         /*.data         =*/ data,
     };
 
@@ -1662,6 +1664,10 @@ const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
 }
 
+bool llama_kv_cache_dsv4::tree_commit(llama_seq_id seq_id, const std::vector<int32_t> & keep_batch_idxs) {
+    return kv_raw->get_swa()->tree_commit(seq_id, keep_batch_idxs);
+}
+
 void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
     if (n_rs_seq == 0) {
         return;
@@ -1799,6 +1805,7 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     }
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
+        kv_swa->record_tree_slots(sinfos_write[i_next], ubatches[i_next]);
         n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
     }
 
@@ -1877,8 +1884,58 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
     kv_swa->set_input_k_idxs(dst, &ubatches_write[i_next], sinfos_write[i_next]);
 }
 
+template<typename T>
+static void dsv4_apply_tree_raw_mask(
+        T * data,
+        int64_t n_kv,
+        const llama_ubatch & ubatch,
+        const llama_kv_cache::slot_info & sinfo) {
+    if (!ubatch.tree_parent) {
+        return;
+    }
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    GGML_ASSERT(sinfo.idxs[0].size() == ubatch.n_tokens);
+    static bool traced = false;
+    if (!traced && std::getenv("LLAMA_DSPARK_PCTREE_TRACE")) {
+        std::ostringstream os;
+        os << "PCTREE_RAW_MASK";
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            os << " [" << i << ":p" << ubatch.pos[i]
+               << "<-" << ubatch.tree_parent[i]
+               << "@" << sinfo.idxs[0][i] << "]";
+        }
+        std::fprintf(stderr, "%s\n", os.str().c_str());
+        traced = true;
+    }
+
+    const T mask_drop = llama_cast<T>(-std::numeric_limits<float>::infinity());
+    std::vector<uint8_t> ancestor(ubatch.n_tokens);
+    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+        std::fill(ancestor.begin(), ancestor.end(), 0);
+        int32_t cur = (int32_t) q;
+        while (cur >= 0) {
+            GGML_ASSERT(cur < (int32_t) ubatch.n_tokens);
+            ancestor[cur] = 1;
+            cur = ubatch.tree_parent[cur];
+        }
+        for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+            if (!ancestor[t]) {
+                data[(size_t) q * n_kv + sinfo.idxs[0][t]] = mask_drop;
+            }
+        }
+    }
+}
+
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+    if (!ubatch->tree_parent || sinfos_write.empty()) {
+        return;
+    }
+    if (dst->type == GGML_TYPE_F16) {
+        dsv4_apply_tree_raw_mask((ggml_fp16_t *) dst->data, dst->ne[0], *ubatch, sinfos_write[i_next]);
+    } else {
+        dsv4_apply_tree_raw_mask((float *) dst->data, dst->ne[0], *ubatch, sinfos_write[i_next]);
+    }
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {

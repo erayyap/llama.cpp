@@ -26,6 +26,12 @@
 #include <utility>
 #include <fstream>
 
+extern bool llama_dsv4_tree_commit(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        const int32_t * keep_batch_idxs,
+        int32_t n_keep);
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -75,8 +81,10 @@ struct server_batch {
         llama_token token;
         llama_pos pos;
         bool output;
+        int32_t tree_parent;
     };
     std::vector<token> tokens;
+    std::vector<int32_t> tree_parents;
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
 
@@ -116,7 +124,17 @@ struct server_batch {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output });
+        tokens.push_back({ id_slot, token, pos, output, -1 });
+        return true;
+    }
+
+    bool add_tree_node(int32_t id_slot, llama_token token, llama_pos pos, bool output, int32_t parent) {
+        GGML_ASSERT(!has_embd);
+        GGML_ASSERT(batch.pos != nullptr);
+        if ((int32_t) tokens.size() >= n_tokens_alloc) {
+            return false;
+        }
+        tokens.push_back({ id_slot, token, pos, output, parent });
         return true;
     }
 
@@ -125,7 +143,7 @@ struct server_batch {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output });
+        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, -1 });
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -133,8 +151,10 @@ struct server_batch {
 
     void clear() {
         tokens.clear();
+        tree_parents.clear();
         embd.clear();
         common_batch_clear(batch);
+        batch.tree_parent = nullptr;
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
@@ -159,9 +179,21 @@ struct server_batch {
         GGML_ASSERT(!batch_rendered);
         GGML_ASSERT(batch.pos != nullptr);
         common_batch_clear(batch);
+        tree_parents.resize(tokens.size(), -1);
+        bool has_tree = false;
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
             common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            tree_parents[i] = t.tree_parent;
+            has_tree |= t.tree_parent >= 0;
+        }
+        batch.tree_parent = has_tree ? tree_parents.data() : nullptr;
+        if (has_tree && std::getenv("LLAMA_DSPARK_PCTREE_TRACE")) {
+            std::string trace = "PCTREE_SERVER_BATCH";
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                trace += " [" + std::to_string(i) + "<-" + std::to_string(tree_parents[i]) + "]";
+            }
+            SRV_INF("%s\n", trace.c_str());
         }
         if (has_embd) {
             batch.token = nullptr; // will be restored on clear()
@@ -187,6 +219,7 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
+            batch.tree_parent ? batch.tree_parent + off : nullptr,
         };
 
         return view;
@@ -209,10 +242,14 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<common_speculative_tree_node> spec_tree;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    std::vector<int32_t> spec_tree_i_batch;
+    int32_t spec_tree_root_i_batch = -1;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_tree_inflight = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -334,6 +371,10 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_tree_inflight = false;
+        spec_tree.clear();
+        spec_tree_i_batch.clear();
+        spec_tree_root_i_batch = -1;
 
         n_prompt_tokens_cache = 0;
 
@@ -497,28 +538,48 @@ struct server_slot {
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
         } else {
-            SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
-                    sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
+            SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, #tree=%zu, pos_next=%d\n",
+                    sampled, prompt.tokens.size(), spec_draft.size(), spec_tree.size(), prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
+            GGML_ASSERT(spec_tree_i_batch.empty());
 
-            spec_i_batch.push_back(batch.size());
-            for (size_t i = 0; i < spec_draft.size(); i++) {
-                spec_i_batch.push_back(batch.size() + i + 1);
-            }
+            const auto pos0 = prompt.tokens.pos_next();
+            if (!spec_tree.empty() && !spec_is_replay) {
+                spec_tree_inflight = true;
+                const int32_t root_idx = batch.size();
+                spec_tree_root_i_batch = root_idx;
+                add_ok &= batch.add(id, sampled, pos0, true);
+                for (size_t i = 0; i < spec_tree.size(); ++i) {
+                    const auto & node = spec_tree[i];
+                    const int32_t parent_idx = node.parent < 0 ? root_idx : spec_tree_i_batch.at(node.parent);
+                    spec_tree_i_batch.push_back(batch.size());
+                    add_ok &= batch.add_tree_node(id, node.token, pos0 + 1 + node.depth, true, parent_idx);
+                }
+            } else {
+                spec_i_batch.push_back(batch.size());
+                for (size_t i = 0; i < spec_draft.size(); i++) {
+                    spec_i_batch.push_back(batch.size() + i + 1);
+                }
 
-            auto pos0 = prompt.tokens.pos_next();
-
-            add_ok &= batch.add(id, sampled, pos0++, true);
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true);
+                auto pos = pos0;
+                add_ok &= batch.add(id, sampled, pos++, true);
+                for (auto token : spec_draft) {
+                    add_ok &= batch.add(this->id, token, pos++, true);
+                }
             }
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
 
         prompt.tokens.push_back(sampled);
-        prompt.tokens.insert(spec_draft);
+        if (spec_tree_inflight) {
+            for (const auto & node : spec_tree) {
+                prompt.tokens.push_back(node.token);
+            }
+        } else {
+            prompt.tokens.insert(spec_draft);
+        }
     }
 
     void release() {
@@ -988,6 +1049,7 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+    bool pctree_verify = false;
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -1071,6 +1133,12 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        const char * pctree_verify_env = std::getenv("LLAMA_DSPARK_PCTREE_VERIFY");
+        pctree_verify = has_draft && pctree_verify_env != nullptr && std::strcmp(pctree_verify_env, "0") != 0;
+        if (pctree_verify) {
+            params_base.n_outputs_max = std::max<uint32_t>(params_base.n_outputs_max, 8u * params_base.n_parallel);
+            SRV_INF("%s", "PCTree packed verification enabled (primary-path commit, off-spine replay)\n");
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -3027,14 +3095,17 @@ private:
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.spec_tree.clear();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .n_max       = */ n_draft_max,
+                            /* .tree_n_max  = */ pctree_verify ? (2 - (slot.prompt.tokens.pos_next() & 3) + 4) & 3 : -1,
+                            /* .n_past      = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .prompt      = */ &slot.spec_prompt,
+                            /* .result      = */ &slot.spec_draft,
+                            /* .tree_result = */ &slot.spec_tree,
                         };
 
                         drafting.push_back(&slot);
@@ -3053,7 +3124,11 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.n_draft_total += draft.size();
+            if (!pctree_verify) {
+                slot.spec_tree.clear();
+            }
+            const bool use_tree = pctree_verify && !slot.spec_tree.empty();
+            slot.n_draft_total += use_tree ? slot.spec_tree.size() : draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3069,11 +3144,11 @@ private:
             }
 
             if (!draft.empty()) {
-                const bool use_ckpt_tgt =
+                const bool use_ckpt_tgt = use_tree ||
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
 
-                const bool use_ckpt_dft =
+                const bool use_ckpt_dft = use_tree ||
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
@@ -3869,13 +3944,83 @@ private:
                 return;
             }
 
-            // save the original draft size
-            const size_t n_draft = slot.spec_draft.size();
+            bool tree_committed = false;
+            size_t n_draft = slot.spec_draft.size();
+            if (slot.spec_tree_inflight) {
+                GGML_ASSERT(slot.spec_tree_root_i_batch >= 0);
+                GGML_ASSERT(slot.spec_tree_i_batch.size() == slot.spec_tree.size());
+
+                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                llama_tokens node_tokens;
+                std::vector<int32_t> node_parents;
+                node_tokens.reserve(slot.spec_tree.size());
+                node_parents.reserve(slot.spec_tree.size());
+                for (const auto & node : slot.spec_tree) {
+                    node_tokens.push_back(node.token);
+                    node_parents.push_back(node.parent);
+                }
+                auto tree_result = common_sampler_sample_and_accept_tree(
+                        slot.smpl.get(), slot.ctx_tgt, slot.spec_tree_root_i_batch,
+                        slot.spec_tree_i_batch, node_tokens, node_parents);
+                GGML_ASSERT(!tree_result.tokens.empty());
+
+                // Compressor state currently persists the first packed node at
+                // each position. That is exactly the accepted state for the
+                // primary packed spine; off-spine paths use safe replay until
+                // general per-node state gathering lands.
+                bool primary_spine = true;
+                for (int32_t idx : tree_result.path) {
+                    for (int32_t j = 0; j < idx; ++j) {
+                        if (slot.spec_tree[j].depth == slot.spec_tree[idx].depth) {
+                            primary_spine = false;
+                            break;
+                        }
+                    }
+                }
+
+                std::vector<int32_t> keep = { 0 };
+                std::vector<int32_t> selected = { slot.spec_tree_root_i_batch };
+                for (int32_t idx : tree_result.path) {
+                    keep.push_back(idx + 1);
+                    selected.push_back(slot.spec_tree_i_batch[idx]);
+                }
+                if (primary_spine &&
+                        common_speculative_process_selected(spec.get(), batch.batch, selected) &&
+                        llama_dsv4_tree_commit(slot.ctx_tgt, slot.id, keep.data(), keep.size())) {
+                    tree_committed = true;
+                    n_draft = slot.spec_tree.size();
+                    slot.spec_draft = std::move(tree_result.tokens);
+                    common_speculative_accept(spec.get(), slot.id, tree_result.path.size());
+                    if (trace > 0) {
+                        SLT_INF(slot, "PCTree committed primary path: %zu/%zu nodes\n",
+                                tree_result.path.size(), slot.spec_tree.size());
+                    }
+                } else {
+                    const auto & ckpt = slot.spec_ckpt;
+                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (slot.ctx_dft) {
+                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
+                    slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                    slot.smpl = std::move(smpl_save);
+                    slot.spec_is_replay = true;
+                    slot.spec_draft = std::move(tree_result.tokens);
+                }
+
+                slot.spec_tree.clear();
+                slot.spec_tree_i_batch.clear();
+                slot.spec_tree_root_i_batch = -1;
+                slot.spec_tree_inflight = false;
+                if (!tree_committed) {
+                    return;
+                }
+            }
 
             GGML_ASSERT(n_draft > 0);
 
-            // verify and try to accept the draft
-            {
+            // verify and try to accept the linear draft
+            if (!tree_committed) {
                 // save the sampler sampler state in case we need to restore it
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 

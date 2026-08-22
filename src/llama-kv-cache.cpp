@@ -1168,6 +1168,42 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+void llama_kv_cache::record_tree_slots(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    tree_slot_idxs.clear();
+    if (!ubatch.tree_parent) {
+        return;
+    }
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    GGML_ASSERT(sinfo.idxs[0].size() == ubatch.n_tokens);
+    tree_slot_idxs = sinfo.idxs[0];
+}
+
+bool llama_kv_cache::tree_commit(llama_seq_id seq_id, const std::vector<int32_t> & keep_batch_idxs) {
+    if (tree_slot_idxs.empty() || seq_id < 0 || (uint32_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    std::vector<uint8_t> keep(tree_slot_idxs.size(), 0);
+    for (int32_t idx : keep_batch_idxs) {
+        if (idx < 0 || (size_t) idx >= keep.size()) {
+            return false;
+        }
+        keep[idx] = 1;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    for (size_t i = 0; i < tree_slot_idxs.size(); ++i) {
+        if (keep[i]) {
+            continue;
+        }
+        const uint32_t cell = tree_slot_idxs[i];
+        if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id)) {
+            cells.seq_rm(cell, seq_id);
+        }
+    }
+    tree_slot_idxs.clear();
+    return true;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {

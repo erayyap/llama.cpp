@@ -84,6 +84,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
 
+struct common_sampler_tree_result {
+    llama_tokens tokens;
+    std::vector<int32_t> path;
+};
+
+common_sampler_tree_result common_sampler_sample_and_accept_tree(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int32_t root_idx,
+        const std::vector<int32_t> & node_idxs,
+        const llama_tokens & node_tokens,
+        const std::vector<int32_t> & node_parents,
+        bool grammar_first = false);
+
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 

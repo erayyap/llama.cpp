@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -124,6 +125,44 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// DSpark low-rank parent-conditioning weights. These staging accessors are
+// used by the PCTree drafter to cache the tiny Markov head on the host while
+// the parallel draft backbone remains on the accelerator.
+LLAMA_API const struct ggml_tensor * llama_model_dspark_markov_w1(const struct llama_model * model);
+LLAMA_API const struct ggml_tensor * llama_model_dspark_markov_w2(const struct llama_model * model);
+
+// Evaluate DSpark's low-rank Markov bias for parent tokens without rerunning
+// the parallel draft backbone. `out` is F32 [n_vocab, n_parents].
+LLAMA_API bool llama_dspark_markov_score(
+        struct llama_context * ctx,
+        const llama_token * parents,
+        int32_t n_parents,
+        float * out);
+
+struct llama_dspark_pctree_level {
+    std::vector<llama_token> candidates;
+    std::vector<float> candidate_probs;
+    std::vector<int32_t> selected;
+};
+
+// Build all parent-conditioned DSpark levels in one accelerator graph. Refined
+// logits are [n_vocab, n_depth]; greedy_parents[d] is the parent used by the
+// existing in-graph greedy chain at depth d.
+LLAMA_API bool llama_dspark_pctree_build(
+        struct llama_context * ctx,
+        const float * refined_logits,
+        const llama_token * greedy_parents,
+        int32_t n_depth,
+        int32_t k,
+        std::vector<llama_dspark_pctree_level> & levels);
+
+// Retain root + accepted packed-tree raw KV rows after DSV4 verification.
+LLAMA_API bool llama_dsv4_tree_commit(
+        struct llama_context * ctx,
+        llama_seq_id seq_id,
+        const int32_t * keep_batch_idxs,
+        int32_t n_keep);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error

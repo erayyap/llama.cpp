@@ -29,6 +29,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+struct common_speculative_tree_node {
+    llama_token token  = LLAMA_TOKEN_NULL;
+    int32_t     parent = -1; // index in the packed node vector; -1 is the verified prefix
+    int32_t     depth  = 0;
+    float       score  = 0.0f; // cumulative log probability under the draft model
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -39,6 +46,7 @@ struct common_speculative_draft_params {
     // overrides individual configurations (-1 disabled)
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
+    int32_t tree_n_max = -1; // optional safe packed-tree depth
 
     llama_pos   n_past;
     llama_token id_last;
@@ -48,6 +56,10 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional packed ancestor-closed tree. Linear-only consumers leave this
+    // null and continue using result unchanged.
+    std::vector<common_speculative_tree_node> * tree_result = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -57,6 +69,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process_selected(
+        common_speculative * spec,
+        const llama_batch & batch,
+        const std::vector<int32_t> & selected);
 
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);

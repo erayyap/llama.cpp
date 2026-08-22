@@ -18,6 +18,9 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <cmath>
+#include <numeric>
+#include <unordered_set>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -164,6 +167,9 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const llama_batch & batch) = 0;
+    virtual bool process_selected(const llama_batch & /*batch*/, const std::vector<int32_t> & /*selected*/) {
+        return true;
+    }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -639,6 +645,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 /*.n_seq_id =*/ nullptr,
                 /*.seq_id   =*/ nullptr,
                 /*.logits   =*/ nullptr,
+                /*.tree_parent =*/ nullptr,
             };
             const int32_t rc = llama_encode(ctx_dft, enc_batch);
             if (rc != 0) {
@@ -942,11 +949,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<int32_t> last_drafted;
     std::vector<float>   acceptance_ema;
 
+    // PCTree stage 1: cache DSpark's low-rank Markov head on the host and
+    // construct a parent-conditioned, ancestor-closed tree from the single
+    // parallel backbone pass. Target tree verification is enabled separately.
+    bool pctree_enabled = false;
+    bool pctree_trace = false;
+    int32_t pctree_k = 2;
+    int32_t pctree_n = 7; // proposed nodes; target root + nodes stays <= 8
+    int64_t pctree_rank = 0;
+    int64_t pctree_vocab = 0;
+    std::vector<std::vector<common_speculative_tree_node>> pctree_scratch;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
+    std::vector<int32_t> feature_rows_override;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1006,6 +1025,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     __func__, this->params.n_max);
         }
 
+        const char * pctree_env = std::getenv("LLAMA_DSPARK_PCTREE");
+        pctree_enabled = is_dspark && pctree_env != nullptr && std::strcmp(pctree_env, "0") != 0;
+        const char * pctree_trace_env = std::getenv("LLAMA_DSPARK_PCTREE_TRACE");
+        pctree_trace = pctree_enabled && pctree_trace_env != nullptr && std::strcmp(pctree_trace_env, "0") != 0;
+        if (pctree_enabled) {
+            if (const char * k_env = std::getenv("LLAMA_DSPARK_PCTREE_K")) {
+                pctree_k = std::clamp(std::atoi(k_env), 1, 4);
+            }
+            if (const char * n_env = std::getenv("LLAMA_DSPARK_PCTREE_N")) {
+                pctree_n = std::clamp(std::atoi(n_env), 1, 7);
+            }
+
+            const ggml_tensor * w1 = llama_model_dspark_markov_w1(model_dft);
+            const ggml_tensor * w2 = llama_model_dspark_markov_w2(model_dft);
+            GGML_ASSERT(w1 && w2 && w1->type == GGML_TYPE_BF16 && w2->type == GGML_TYPE_BF16);
+            GGML_ASSERT(w1->ne[0] == w2->ne[0] && w1->ne[1] == w2->ne[1]);
+            pctree_rank  = w1->ne[0];
+            pctree_vocab = w1->ne[1];
+            pctree_scratch.resize(n_seq);
+            LOG_INF("%s: PCTree parent scoring enabled (k=%d, nodes=%d, rank=%lld, vocab=%lld, backend=accelerator)\n",
+                    __func__, pctree_k, pctree_n, (long long) pctree_rank, (long long) pctree_vocab);
+        }
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1022,6 +1064,97 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+    }
+
+    void build_pctree(
+            llama_context * ctx_dft,
+            int32_t i_logits_beg,
+            int32_t n_depth,
+            llama_token anchor,
+            const llama_tokens & linear,
+            std::vector<common_speculative_tree_node> & packed) const {
+        struct work_node {
+            llama_token token;
+            int32_t parent;
+            int32_t depth;
+            double score;
+            int32_t stable_id;
+        };
+        packed.clear();
+        if (!pctree_enabled || n_depth <= 0 || linear.size() < (size_t) n_depth) {
+            return;
+        }
+
+        std::vector<work_node> pool;
+        int32_t stable_id = 0;
+
+        std::vector<float> refined((size_t) pctree_vocab * n_depth);
+        std::vector<llama_token> greedy_parents(n_depth);
+        for (int32_t depth = 0; depth < n_depth; ++depth) {
+            const float * logits = llama_get_logits_ith(ctx_dft, i_logits_beg + depth);
+            GGML_ASSERT(logits != nullptr);
+            std::memcpy(refined.data() + (size_t) depth * pctree_vocab,
+                    logits, (size_t) pctree_vocab * sizeof(float));
+            greedy_parents[depth] = depth == 0 ? anchor : linear[depth - 1];
+        }
+
+        std::vector<llama_dspark_pctree_level> levels;
+        if (!llama_dspark_pctree_build(ctx_dft, refined.data(), greedy_parents.data(),
+                    n_depth, pctree_k, levels)) {
+            LOG_ERR("%s: accelerator PCTree construction failed\n", __func__);
+            return;
+        }
+        GGML_ASSERT((int32_t) levels.size() == n_depth);
+
+        std::vector<int32_t> frontier_pool = { -1 };
+        for (int32_t depth = 0; depth < n_depth; ++depth) {
+            const auto & level = levels[depth];
+            GGML_ASSERT(level.candidates.size() == level.candidate_probs.size());
+            const int32_t n_parents = depth == 0 ? 1 : pctree_k;
+            GGML_ASSERT((int32_t) level.candidates.size() == n_parents * pctree_k);
+            const int32_t pool_beg = (int32_t) pool.size();
+            for (int32_t c = 0; c < (int32_t) level.candidates.size(); ++c) {
+                const int32_t parent_slot = c / pctree_k;
+                const int32_t parent = depth == 0 ? -1 : frontier_pool.at(parent_slot);
+                const double prob = std::max<double>(level.candidate_probs[c], 1e-30);
+                pool.push_back({ level.candidates[c], parent, depth, std::log(prob), stable_id++ });
+            }
+            frontier_pool.clear();
+            for (int32_t selected : level.selected) {
+                GGML_ASSERT(selected >= 0 && selected < (int32_t) level.candidates.size());
+                frontier_pool.push_back(pool_beg + selected);
+            }
+            GGML_ASSERT((int32_t) frontier_pool.size() == pctree_k);
+        }
+
+        std::vector<int32_t> ranked(pool.size());
+        std::iota(ranked.begin(), ranked.end(), 0);
+        std::stable_sort(ranked.begin(), ranked.end(), [&](int32_t a, int32_t b) {
+            if (pool[a].score != pool[b].score) return pool[a].score > pool[b].score;
+            if (pool[a].depth != pool[b].depth) return pool[a].depth < pool[b].depth;
+            return pool[a].stable_id < pool[b].stable_id;
+        });
+        if ((int) ranked.size() > pctree_n) {
+            ranked.resize(pctree_n);
+        }
+
+        std::unordered_set<int32_t> selected(ranked.begin(), ranked.end());
+        for (int32_t idx : ranked) {
+            for (int32_t p = pool[idx].parent; p >= 0; p = pool[p].parent) {
+                GGML_ASSERT(selected.count(p) && "PCTree score ordering must preserve ancestors");
+            }
+        }
+
+        std::stable_sort(ranked.begin(), ranked.end(), [&](int32_t a, int32_t b) {
+            if (pool[a].depth != pool[b].depth) return pool[a].depth < pool[b].depth;
+            return pool[a].stable_id < pool[b].stable_id;
+        });
+        std::map<int32_t, int32_t> remap;
+        for (int32_t idx : ranked) {
+            remap[idx] = (int32_t) packed.size();
+            const int32_t parent = pool[idx].parent < 0 ? -1 : remap.at(pool[idx].parent);
+            packed.push_back({ pool[idx].token, parent, pool[idx].depth, (float) pool[idx].score });
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1054,6 +1187,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        // Packed target rows are injected only after target verification.
+        if (batch_in.tree_parent && feature_rows_override.empty()) {
+            return true;
+        }
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1102,7 +1239,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        const int32_t feature_row = feature_rows_override.empty() ? row : feature_rows_override.at(row);
+                        const float * src = layer + (size_t) feature_row * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -1116,6 +1255,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.n_seq_id =*/ nullptr,
                     /*.seq_id   =*/ nullptr,
                     /*.logits   =*/ nullptr,
+                    /*.tree_parent =*/ nullptr,
                 };
 
                 int32_t rc = llama_encode(ctx_dft, enc_batch);
@@ -1148,6 +1288,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         return true;
+    }
+
+    bool process_selected(const llama_batch & batch_in, const std::vector<int32_t> & selected) override {
+        if (selected.empty()) {
+            return true;
+        }
+        llama_tokens tokens(selected.size());
+        std::vector<llama_pos> pos(selected.size());
+        std::vector<int32_t> n_seq_id(selected.size(), 1);
+        std::vector<llama_seq_id> seq_data(selected.size());
+        std::vector<llama_seq_id *> seq_id(selected.size());
+        std::vector<int8_t> logits(selected.size(), 0);
+        for (size_t i = 0; i < selected.size(); ++i) {
+            const int32_t src = selected[i];
+            GGML_ASSERT(src >= 0 && src < batch_in.n_tokens);
+            tokens[i] = batch_in.token[src];
+            pos[i] = batch_in.pos[src];
+            seq_data[i] = batch_in.seq_id[src][0];
+            seq_id[i] = &seq_data[i];
+        }
+        llama_batch compact = {
+            /*.n_tokens =*/ (int32_t) selected.size(),
+            /*.token    =*/ tokens.data(),
+            /*.embd     =*/ nullptr,
+            /*.pos      =*/ pos.data(),
+            /*.n_seq_id =*/ n_seq_id.data(),
+            /*.seq_id   =*/ seq_id.data(),
+            /*.logits   =*/ logits.data(),
+            /*.tree_parent =*/ nullptr,
+        };
+        feature_rows_override = selected;
+        const bool ok = process(compact);
+        feature_rows_override.clear();
+        return ok;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1232,6 +1406,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                }
+
+                auto & tree = dp.tree_result ? *dp.tree_result : pctree_scratch[seq_id];
+                const int32_t tree_depth = dp.tree_n_max >= 0 ?
+                    std::min<int32_t>(result.size(), dp.tree_n_max) : (int32_t) result.size();
+                build_pctree(ctx_dft, beg, tree_depth, dp.id_last, result, tree);
+                if (pctree_trace) {
+                    std::string nodes;
+                    for (size_t j = 0; j < tree.size(); ++j) {
+                        char buf[128];
+                        std::snprintf(buf, sizeof(buf), "%s%zu:%d<-%d@%d(%.4f)",
+                                j == 0 ? "" : ",", j, tree[j].token, tree[j].parent,
+                                tree[j].depth, tree[j].score);
+                        nodes += buf;
+                    }
+                    LOG_INF("PCTREE_TRACE seq=%d linear=%zu nodes=%zu [%s]\n",
+                            seq_id, result.size(), tree.size(), nodes.c_str());
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -2592,6 +2783,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         result = result && impl->process(batch);
     }
 
+    return result;
+}
+
+bool common_speculative_process_selected(
+        common_speculative * spec,
+        const llama_batch & batch,
+        const std::vector<int32_t> & selected) {
+    if (spec == nullptr) {
+        return true;
+    }
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        result = result && impl->process_selected(batch, selected);
+    }
     return result;
 }
 

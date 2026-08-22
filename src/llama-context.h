@@ -119,6 +119,16 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // Evaluate only DSpark's low-rank parent-conditioning head. Output is
+    // column-major [n_vocab, n_parents] in F32.
+    bool dspark_markov_score(const llama_token * parents, int32_t n_parents, float * out);
+    bool dspark_pctree_build(
+            const float * refined_logits,
+            const llama_token * greedy_parents,
+            int32_t n_depth,
+            int32_t k,
+            std::vector<llama_dspark_pctree_level> & levels);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -342,6 +352,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched_dspark_markov;
 
     bool sched_need_reserve = true;
 
