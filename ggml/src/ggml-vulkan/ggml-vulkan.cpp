@@ -3801,7 +3801,11 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     }
 
     // Optional decode specialization: keep two-row verification on the exact N=1 tile.
-    static const bool scalar_decode_tile = getenv("GGML_VK_FA_SCALAR_DECODE_TILE") != nullptr;
+    // Follow the backend's opt-in convention: unset or =0 disables the path.
+    static const bool scalar_decode_tile = [] {
+        const char * env = getenv("GGML_VK_FA_SCALAR_DECODE_TILE");
+        return env != nullptr && std::strcmp(env, "0") != 0;
+    }();
     if (scalar_decode_tile && n_rows == 2) {
         result.block_rows = 1;
         result.block_cols = 64;
@@ -3932,7 +3936,10 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
-    static const bool force_scalar = getenv("GGML_VK_FA_FORCE_SCALAR") != nullptr;
+    static const bool force_scalar = [] {
+        const char * env = getenv("GGML_VK_FA_FORCE_SCALAR");
+        return env != nullptr && std::strcmp(env, "0") != 0;
+    }();
     if (force_scalar && n_rows == 2) {
         path = FA_SCALAR;
     }

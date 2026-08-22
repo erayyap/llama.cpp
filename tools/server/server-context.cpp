@@ -3024,7 +3024,9 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else {
+                    } else if (!slot.spec_adaptive_raw) {
+                        // A context-cutoff step is target-only: do not create and immediately
+                        // restore an unused draft checkpoint.
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(

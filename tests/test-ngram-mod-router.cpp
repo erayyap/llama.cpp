@@ -145,7 +145,7 @@ int main() {
         tokens draft;
         common_speculative_begin(spec.get(), 0, prompt);
         common_speculative_get_draft_params(spec.get(), 0) = {
-            true, 64, (llama_pos) prompt.size(), source[23], &prompt, &draft, nullptr,
+            true, 64, (llama_pos) prompt.size(), source[23], &prompt, &draft,
         };
         common_speculative_draft(spec.get());
         require(!draft.empty());
