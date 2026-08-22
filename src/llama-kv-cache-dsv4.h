@@ -48,6 +48,10 @@ public:
 
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
+    ggml_tensor * cpy_tree_kv   (ggml_context * ctx, ggml_tensor * cur, int32_t il) const;
+    ggml_tensor * cpy_tree_score(ggml_context * ctx, ggml_tensor * cur, int32_t il) const;
+    bool tree_commit(llama_seq_id seq_id, const std::vector<llama_pos> & positions,
+            const std::vector<int32_t> & keep_batch_idxs) const;
 
 private:
     struct layer {
@@ -55,9 +59,15 @@ private:
 
         ggml_tensor * kv;
         ggml_tensor * score;
+        ggml_tensor * tree_kv;
+        ggml_tensor * tree_score;
 
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
+        std::vector<ggml_tensor *> kv_rows;
+        std::vector<ggml_tensor *> score_rows;
+        std::vector<ggml_tensor *> tree_kv_rows;
+        std::vector<ggml_tensor *> tree_score_rows;
     };
 
     const uint32_t ratio;
@@ -152,6 +162,7 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
     bool tree_commit(llama_seq_id seq_id, const std::vector<int32_t> & keep_batch_idxs);
+    void record_tree_batch(const llama_ubatch & ubatch);
 
 private:
     llama_hparams hparams_raw;
@@ -171,6 +182,8 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+
+    std::vector<llama_pos> tree_positions;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };
@@ -374,6 +387,7 @@ public:
 
 private:
     size_t i_next = 0;
+    llama_kv_cache_dsv4 * owner = nullptr;
 
     std::vector<llama_ubatch> ubatches;
 

@@ -998,6 +998,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         hca_state_score = ggml_add(ctx0, hca_state_score, ape_rows);
         cb(hca_state_score, "hca_state_score_ape", il);
 
+        if (inp_dsv4->tree) {
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_hca_state()->cpy_tree_kv(ctx0, hca_state_kv, il));
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_hca_state()->cpy_tree_score(ctx0, hca_state_score, il));
+        }
+
     }
 
     if (ratio == DSV4_CSA_RATIO && inp_dsv4->get_csa().state_pos) {
@@ -1012,6 +1017,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_tensor * csa_ape_rows = ggml_get_rows(ctx0, csa_ape, inp_dsv4->get_csa().state_pos);
         csa_state_score = ggml_add(ctx0, csa_state_score, csa_ape_rows);
         cb(csa_state_score, "csa_state_score_ape", il);
+
+        if (inp_dsv4->tree) {
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa_state()->cpy_tree_kv(ctx0, csa_state_kv, il));
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa_state()->cpy_tree_score(ctx0, csa_state_score, il));
+        }
 
         GGML_ASSERT(inp_dsv4->get_csa().state_write_idxs);
 
@@ -1081,6 +1091,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_tensor * lid_ape_rows = ggml_get_rows(ctx0, lid_ape, inp_dsv4->get_lid().state_pos);
         lid_state_score = ggml_add(ctx0, lid_state_score, lid_ape_rows);
         cb(lid_state_score, "lid_state_score_ape", il);
+
+        if (inp_dsv4->tree) {
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid_state()->cpy_tree_kv(ctx0, lid_state_kv, il));
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid_state()->cpy_tree_score(ctx0, lid_state_score, il));
+        }
 
         GGML_ASSERT(inp_dsv4->get_lid().state_write_idxs);
 

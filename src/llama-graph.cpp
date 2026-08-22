@@ -999,6 +999,7 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     inp_raw->mctx = mctx->get_raw();
 
     bool res = true;
+    res &= tree == (params.ubatch.tree_parent != nullptr);
 
     const auto & plan_csa = mctx->get_csa_plan(params.ubatch);
     const auto & plan_hca = mctx->get_hca_plan(params.ubatch);
@@ -3334,6 +3335,7 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
 
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
+    inp->tree = ubatch.tree_parent != nullptr;
 
     dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
     dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);

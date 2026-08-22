@@ -1137,7 +1137,7 @@ private:
         pctree_verify = has_draft && pctree_verify_env != nullptr && std::strcmp(pctree_verify_env, "0") != 0;
         if (pctree_verify) {
             params_base.n_outputs_max = std::max<uint32_t>(params_base.n_outputs_max, 8u * params_base.n_parallel);
-            SRV_INF("%s", "PCTree packed verification enabled (primary-path commit, off-spine replay)\n");
+            SRV_INF("%s", "PCTree packed verification enabled (accepted-path DSV4 state commit)\n");
         }
 
         if (callback_state) {
@@ -3144,11 +3144,11 @@ private:
             }
 
             if (!draft.empty()) {
-                const bool use_ckpt_tgt = use_tree ||
+                const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
 
-                const bool use_ckpt_dft = use_tree ||
+                const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
@@ -3950,7 +3950,6 @@ private:
                 GGML_ASSERT(slot.spec_tree_root_i_batch >= 0);
                 GGML_ASSERT(slot.spec_tree_i_batch.size() == slot.spec_tree.size());
 
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
                 llama_tokens node_tokens;
                 std::vector<int32_t> node_parents;
                 node_tokens.reserve(slot.spec_tree.size());
@@ -3964,48 +3963,24 @@ private:
                         slot.spec_tree_i_batch, node_tokens, node_parents);
                 GGML_ASSERT(!tree_result.tokens.empty());
 
-                // Compressor state currently persists the first packed node at
-                // each position. That is exactly the accepted state for the
-                // primary packed spine; off-spine paths use safe replay until
-                // general per-node state gathering lands.
-                bool primary_spine = true;
-                for (int32_t idx : tree_result.path) {
-                    for (int32_t j = 0; j < idx; ++j) {
-                        if (slot.spec_tree[j].depth == slot.spec_tree[idx].depth) {
-                            primary_spine = false;
-                            break;
-                        }
-                    }
-                }
-
                 std::vector<int32_t> keep = { 0 };
                 std::vector<int32_t> selected = { slot.spec_tree_root_i_batch };
                 for (int32_t idx : tree_result.path) {
                     keep.push_back(idx + 1);
                     selected.push_back(slot.spec_tree_i_batch[idx]);
                 }
-                if (primary_spine &&
-                        common_speculative_process_selected(spec.get(), batch.batch, selected) &&
+                if (common_speculative_process_selected(spec.get(), batch.batch, selected) &&
                         llama_dsv4_tree_commit(slot.ctx_tgt, slot.id, keep.data(), keep.size())) {
                     tree_committed = true;
                     n_draft = slot.spec_tree.size();
                     slot.spec_draft = std::move(tree_result.tokens);
                     common_speculative_accept(spec.get(), slot.id, tree_result.path.size());
                     if (trace > 0) {
-                        SLT_INF(slot, "PCTree committed primary path: %zu/%zu nodes\n",
+                        SLT_INF(slot, "PCTree committed packed path: %zu/%zu nodes\n",
                                 tree_result.path.size(), slot.spec_tree.size());
                     }
                 } else {
-                    const auto & ckpt = slot.spec_ckpt;
-                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    if (slot.ctx_dft) {
-                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    }
-                    slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
-                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                    slot.smpl = std::move(smpl_save);
-                    slot.spec_is_replay = true;
-                    slot.spec_draft = std::move(tree_result.tokens);
+                    throw std::runtime_error("PCTree accepted-path state commit failed");
                 }
 
                 slot.spec_tree.clear();

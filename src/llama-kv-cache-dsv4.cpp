@@ -18,6 +18,7 @@
 
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
+static constexpr uint32_t DSV4_TREE_MAX_ROWS = 8;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
@@ -870,7 +871,8 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((4u + 2u*n_stream + 2u*state_size*n_stream +
+                                    2u*DSV4_TREE_MAX_ROWS)*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -912,23 +914,44 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         }
 
         const uint32_t n_planes = n_stream*(1 + n_rs_seq);
-        ggml_tensor * kv    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_planes);
-        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_planes);
+        ggml_tensor * kv         = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_planes);
+        ggml_tensor * score      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_planes);
+        ggml_tensor * tree_kv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_state, DSV4_TREE_MAX_ROWS);
+        ggml_tensor * tree_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_state, DSV4_TREE_MAX_ROWS);
 
-        ggml_format_name(kv,    "dsv4_%s_state_kv_l%d",    name, il);
-        ggml_format_name(score, "dsv4_%s_state_score_l%d", name, il);
+        ggml_format_name(kv,         "dsv4_%s_state_kv_l%d",         name, il);
+        ggml_format_name(score,      "dsv4_%s_state_score_l%d",      name, il);
+        ggml_format_name(tree_kv,    "dsv4_%s_tree_state_kv_l%d",    name, il);
+        ggml_format_name(tree_score, "dsv4_%s_tree_state_score_l%d", name, il);
 
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
+        std::vector<ggml_tensor *> kv_rows;
+        std::vector<ggml_tensor *> score_rows;
+        std::vector<ggml_tensor *> tree_kv_rows;
+        std::vector<ggml_tensor *> tree_score_rows;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             kv_stream.push_back(ggml_view_2d(ctx, kv, n_embd_state, state_size, kv->nb[1], s*kv->nb[2]));
             score_stream.push_back(ggml_view_2d(ctx, score, n_embd_state, state_size, score->nb[1], s*score->nb[2]));
         }
 
+        const size_t row_size = ggml_row_size(GGML_TYPE_F32, n_embd_state);
+        for (uint32_t r = 0; r < state_size*n_stream; ++r) {
+            kv_rows.push_back(ggml_view_1d(ctx, kv, n_embd_state, r*row_size));
+            score_rows.push_back(ggml_view_1d(ctx, score, n_embd_state, r*row_size));
+        }
+        for (uint32_t r = 0; r < DSV4_TREE_MAX_ROWS; ++r) {
+            tree_kv_rows.push_back(ggml_view_1d(ctx, tree_kv, n_embd_state, r*row_size));
+            tree_score_rows.push_back(ggml_view_1d(ctx, tree_score, n_embd_state, r*row_size));
+        }
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, kv, score, std::move(kv_stream), std::move(score_stream) });
+        layers.push_back({ il, kv, score, tree_kv, tree_score,
+                std::move(kv_stream), std::move(score_stream),
+                std::move(kv_rows), std::move(score_rows),
+                std::move(tree_kv_rows), std::move(tree_score_rows) });
     }
 
     for (auto & [buft, ctx] : ctx_map) {
@@ -1141,6 +1164,42 @@ ggml_tensor * llama_dsv4_comp_state::cpy_kv(ggml_context * ctx, ggml_tensor * cu
 
 ggml_tensor * llama_dsv4_comp_state::cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const {
     return ggml_set_rows(ctx, get_score_all(ctx, il), cur, idxs);
+}
+
+ggml_tensor * llama_dsv4_comp_state::cpy_tree_kv(ggml_context * ctx, ggml_tensor * cur, int32_t il) const {
+    GGML_ASSERT(cur->ne[1] <= DSV4_TREE_MAX_ROWS);
+    const auto & layer = layers[map_layer_ids.at(il)];
+    ggml_tensor * dst = ggml_view_2d(ctx, layer.tree_kv, layer.tree_kv->ne[0], cur->ne[1], layer.tree_kv->nb[1], 0);
+    return ggml_cpy(ctx, cur, dst);
+}
+
+ggml_tensor * llama_dsv4_comp_state::cpy_tree_score(ggml_context * ctx, ggml_tensor * cur, int32_t il) const {
+    GGML_ASSERT(cur->ne[1] <= DSV4_TREE_MAX_ROWS);
+    const auto & layer = layers[map_layer_ids.at(il)];
+    ggml_tensor * dst = ggml_view_2d(ctx, layer.tree_score, layer.tree_score->ne[0], cur->ne[1], layer.tree_score->nb[1], 0);
+    return ggml_cpy(ctx, cur, dst);
+}
+
+bool llama_dsv4_comp_state::tree_commit(
+        llama_seq_id seq_id,
+        const std::vector<llama_pos> & positions,
+        const std::vector<int32_t> & keep_batch_idxs) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_stream || positions.empty()) {
+        return false;
+    }
+    for (int32_t idx : keep_batch_idxs) {
+        if (idx < 0 || (size_t) idx >= positions.size() || (uint32_t) idx >= DSV4_TREE_MAX_ROWS) {
+            return false;
+        }
+    }
+    for (const auto & layer : layers) {
+        for (int32_t idx : keep_batch_idxs) {
+            const uint32_t dst = (uint32_t) seq_id*state_size + (uint32_t) (positions[idx] % state_size);
+            ggml_backend_tensor_copy(layer.tree_kv_rows[idx], layer.kv_rows[dst]);
+            ggml_backend_tensor_copy(layer.tree_score_rows[idx], layer.score_rows[dst]);
+        }
+    }
+    return true;
 }
 
 size_t llama_dsv4_comp_state::total_size() const {
@@ -1665,7 +1724,24 @@ const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
 }
 
 bool llama_kv_cache_dsv4::tree_commit(llama_seq_id seq_id, const std::vector<int32_t> & keep_batch_idxs) {
-    return kv_raw->get_swa()->tree_commit(seq_id, keep_batch_idxs);
+    if (tree_positions.empty()) {
+        return false;
+    }
+    const bool states_ok =
+        csa_state->tree_commit(seq_id, tree_positions, keep_batch_idxs) &&
+        hca_state->tree_commit(seq_id, tree_positions, keep_batch_idxs) &&
+        lid_state->tree_commit(seq_id, tree_positions, keep_batch_idxs);
+    const bool raw_ok = kv_raw->get_swa()->tree_commit(seq_id, keep_batch_idxs);
+    tree_positions.clear();
+    return states_ok && raw_ok;
+}
+
+void llama_kv_cache_dsv4::record_tree_batch(const llama_ubatch & ubatch) {
+    tree_positions.clear();
+    if (!ubatch.tree_parent || ubatch.n_tokens > DSV4_TREE_MAX_ROWS) {
+        return;
+    }
+    tree_positions.assign(ubatch.pos, ubatch.pos + ubatch.n_tokens);
 }
 
 void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
@@ -2009,6 +2085,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status sta
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         llama_kv_cache_dsv4 * kv) :
+    owner(kv),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw())),
     ctx_csa_mem(kv->get_csa()->init_full()),
     ctx_hca_mem(kv->get_hca()->init_full()),
@@ -2032,6 +2109,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         stream_copy_info sc_info_csa,
         stream_copy_info sc_info_hca,
         stream_copy_info sc_info_lid) :
+    owner(kv),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), lctx, optimize)),
     ctx_csa_mem(kv->get_csa()->init_update(lctx, optimize)),
     ctx_hca_mem(kv->get_hca()->init_update(lctx, optimize)),
@@ -2057,6 +2135,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
+    owner(kv),
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
@@ -2119,6 +2198,9 @@ bool llama_kv_cache_dsv4_context::apply() {
     bool res = true;
 
     res = res & ctx_raw->apply();
+    if (owner && !ubatches.empty()) {
+        owner->record_tree_batch(ubatches[i_next]);
+    }
 
     if (ctx_csa_mem) {
         res = res & ctx_csa_mem->apply();

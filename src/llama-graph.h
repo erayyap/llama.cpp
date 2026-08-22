@@ -602,6 +602,7 @@ public:
     comp_input inp_csa;
     comp_input inp_hca;
     comp_input inp_lid;
+    bool tree = false;
 
     const llama_cparams cparams;
 
