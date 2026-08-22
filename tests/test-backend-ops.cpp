@@ -9973,11 +9973,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // DeepSeek V4 grouped attention-output projection: eight independent
-    // q8_0 matrices, exercised at the speculative verification widths.
-    for (int n : { 1, 2, 3, 4, 5 }) {
+    // q8_0 matrices, exercised at the normal DSpark and long n-gram verification widths.
+    for (int n : { 1, 2, 3, 4, 5, 48 }) {
         test_cases.emplace_back(new test_mul_mat(
             GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}));
     }
+    // Long n-gram verification uses the regular batched MoE route rather than
+    // the width-2..5 fixed verifier shaders. Eight matrices are enough to cover
+    // the width-48 routing/indexing logic without allocating the full 256 experts.
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 8, 6, false, 2048, 48, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_Q2_K, GGML_TYPE_F32, 8, 6, false, 4096, 48, 2048));
 
     // lightning_indexer
     for (int kv : { 256 }) {
@@ -9999,8 +10006,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   5, 1, 1, type_K));
         test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  15, 1, 1, type_K));
         test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, type_K));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  48, 1, 1, type_K));
         test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, type_K));
-        for (int bs : { 1, 2, 5 }) {
+        for (int bs : { 1, 2, 5, 48 }) {
             test_cases.emplace_back(new test_lightning_indexer_top_k(4096, bs, type_K));
         }
     }
@@ -10017,6 +10025,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  5, 1024, 512, true, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  6, 1024, 512, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  8, 1024, 512, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192, 48, 1024, 512, false, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,  5, 1024, 512, true, GGML_TYPE_Q8_0, 2));
     // Nathan-style fused decoded gather variants adapted to query-private compaction.
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false, GGML_TYPE_Q4_0));

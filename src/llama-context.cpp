@@ -2760,15 +2760,22 @@ public:
             }
 
             if (need_alloc) {
-                if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
+                const size_t size_needed = ggml_backend_alloc_ctx_tensors_from_buft_size(mbuf.ctx.get(), buft);
+                const size_t size_current = mbuf_cur.buf ? ggml_backend_buffer_get_size(mbuf_cur.buf.get()) : 0;
+
+                // Equal tensor payload does not imply equal allocator size: changed view offsets or
+                // shapes can require more alignment padding. Reusing an undersized device checkpoint
+                // buffer used to abort in ggml_tallocr_alloc after long speculative runs.
+                if (!mbuf_cur.buf || size_current < size_needed) {
                     mbuf_cur = std::move(mbuf);
 
                     mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
 
-                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
+                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB (required %.3f MiB)\n",
+                            __func__, ggml_backend_buft_name(buft),
+                            (double) mbuf_cur.total_size/1024.0/1024.0,
+                            (double) size_needed/1024.0/1024.0);
                 } else {
-                    //LLAMA_LOG_INFO("%s: reallocating tensors in '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
-
                     // save the old buffer and allocate the new tensors in it
                     auto buf = std::move(mbuf_cur.buf);
 
