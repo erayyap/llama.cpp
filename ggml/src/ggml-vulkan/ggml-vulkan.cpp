@@ -11787,9 +11787,13 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     const bool     bitmap_fits = (uint64_t) ((k->ne[1] - n_kv_raw) + 31) / 32 <= max_words;
 
     static const char * union_env = getenv("GGML_VK_FA_TOPK_UNION");
+    static const uint32_t union_min_batch = [] {
+        const char * env = getenv("GGML_VK_FA_TOPK_UNION_MIN_BATCH");
+        return env ? (uint32_t) std::clamp(atoi(env), 2, 63) : 5u;
+    }();
     const bool gather_union_q8 = gather_q8 && ctx->device->pipeline_flash_attn_gather_union_dq_q8_0;
     if ((!union_env || union_env[0] != '0') && (gather_f16 || gather_union_q8) &&
-        q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
+        q->ne[3] == 1 && n_batch >= union_min_batch && bitmap_fits &&
         ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
         ggml_vk_fa_union_stat_init(ctx)) {
         const uint32_t max_union = n_cand;
