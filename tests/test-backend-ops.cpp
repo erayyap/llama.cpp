@@ -10511,6 +10511,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, type_K));
             }
         }
+        for (int bs : { 6, 8, 15 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, GGML_TYPE_F16));
+        }
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 131072, 1, 1, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 131072, 1, 1, 1, GGML_TYPE_Q8_0));
