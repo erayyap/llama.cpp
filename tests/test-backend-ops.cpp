@@ -10570,6 +10570,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int nb : { 8, 16 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, GGML_TYPE_F16, 1, 86));
     }
+    // Q8 production-cache union fixtures. Seed each batch estimator, then measure it across depth.
+    for (int nb : { 2, 4, 5 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, GGML_TYPE_Q8_0, 1, 60));
+    }
+    for (int kv : { 11008, 35584, 133888 }) {
+        for (int nb : { 2, 4, 5 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 2304, 512, false, GGML_TYPE_Q8_0, 1, 60));
+        }
+    }
 
     return test_cases;
 }
