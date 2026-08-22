@@ -11518,10 +11518,14 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
     // the f16 scratch, the same pass the dense path uses. K and V are the same tensor here, so
     // one pass covers both. Without this a quantised cache declines to dense FA, which costs
     // O(kv) where the sparse path costs O(n_kv_raw + n_top_k).
+    //
+    // This is opt-in because the Q8 -> f16 conversion changes deep-context logits enough to
+    // alter sampled trajectories. It is substantially faster, but failed one strict long-prompt
+    // instruction-following fixture; keep the production-equivalent native-Q8 path by default.
     static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
     const uint64_t kv_f16_sz = (uint64_t) ggml_nelements(k) * sizeof(ggml_fp16_t);
     const bool dequant_kv = top_k && k->type != GGML_TYPE_F16 &&
-                            !(fa_dequant_env && fa_dequant_env[0] == '0') &&
+                            fa_dequant_env && fa_dequant_env[0] == '1' &&
                             ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                             k->nb[0] == ggml_type_size(k->type) &&
                             ggml_is_contiguously_allocated(k) &&
