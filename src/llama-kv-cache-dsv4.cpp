@@ -29,6 +29,14 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
+static bool dsv4_rs_demand_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_DSV4_RS_DEMAND");
+        return env && std::atoi(env) > 0;
+    }();
+    return enabled;
+}
+
 static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
     GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(tensor->ne[3] == 1);
@@ -649,8 +657,16 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             }
 
             const uint32_t n_seq_tokens = (uint32_t) token_idxs.size();
+            // Long n-gram verification needs one scratch plane per candidate in the current
+            // target batch, but it does not need to shift the entire allocated rollback
+            // history during every ordinary one-to-five-token DSpark batch. In demand mode,
+            // materialize only the states that the current batch can immediately roll back.
+            // Arbitrary later rewinds beyond this batch must use a full checkpoint.
+            const uint32_t n_rs_snapshot = dsv4_rs_demand_enabled()
+                ? std::min(n_rs_seq, n_seq_tokens)
+                : n_rs_seq;
             const int64_t scratch_off = (int64_t) state_rows*(1 + n_rs_seq);
-            for (uint32_t d = 1; d <= n_rs_seq; ++d) {
+            for (uint32_t d = 1; d <= n_rs_snapshot; ++d) {
                 const int64_t dst_plane = (int64_t) d*state_rows;
 
                 for (uint32_t r = 0; r < state_size; ++r) {
@@ -1177,6 +1193,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
     rs_idx(n_seq_max, 0) {
+
+    if (n_rs_seq > 0 && dsv4_rs_demand_enabled()) {
+        LLAMA_LOG_WARN("%s: demand-driven recurrent snapshots enabled; only immediate latest-batch rollback is valid, disable prompt-cache rewinds\n", __func__);
+    }
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
