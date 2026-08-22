@@ -213,6 +213,8 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    llama_token spec_replay_replacement = LLAMA_TOKEN_NULL;
+    common_sampler_ptr spec_replay_sampler;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -337,6 +339,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_replay_replacement = LLAMA_TOKEN_NULL;
+        spec_replay_sampler.reset();
 
         n_prompt_tokens_cache = 0;
 
@@ -3836,15 +3840,26 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            const bool replay_replacement = slot.spec_is_replay;
             llama_token id;
-            {
+            if (replay_replacement) {
+                // The replacement was already sampled from the authoritative target logits
+                // before checkpoint restore. Reuse its token and complete sampler state.
+                GGML_ASSERT(slot.spec_replay_replacement != LLAMA_TOKEN_NULL);
+                GGML_ASSERT(slot.spec_replay_sampler);
+                id = slot.spec_replay_replacement;
+                slot.spec_replay_replacement = LLAMA_TOKEN_NULL;
+                slot.smpl = std::move(slot.spec_replay_sampler);
+            } else {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            if (!replay_replacement) {
+                common_sampler_accept(slot.smpl.get(), id, true);
+            }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -3909,15 +3924,15 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 std::vector<llama_token> accepted;
                 if (slot.spec_is_replay) {
-                    // replayed tokens were accepted before the restore; re-verifying them can
-                    // disagree when logits depend on batch shape, and each disagreement restores
-                    // the same checkpoint again - the slot stops making progress
+                    // Replayed tokens and the target replacement were already selected before
+                    // checkpoint restore. Preserve their token and sampler state exactly; only
+                    // rebuild target/draft model state.
+                    GGML_ASSERT(slot.spec_replay_replacement != LLAMA_TOKEN_NULL);
+                    GGML_ASSERT(slot.spec_replay_sampler);
                     accepted = slot.spec_draft;
-                    for (const llama_token id : accepted) {
-                        common_sampler_accept(slot.smpl.get(), id, true);
-                    }
-                    accepted.push_back(common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch.back()));
-                    common_sampler_accept(slot.smpl.get(), accepted.back(), true);
+                    accepted.push_back(slot.spec_replay_replacement);
+                    slot.spec_replay_replacement = LLAMA_TOKEN_NULL;
+                    slot.smpl = std::move(slot.spec_replay_sampler);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
@@ -3938,8 +3953,11 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // Replay only accepted draft tokens. Sample the target replacement again after replay.
+                        // Replay only accepted draft tokens, then reuse the authoritative target
+                        // replacement that was sampled before the checkpoint restore.
                         slot.spec_is_replay = true;
+                        slot.spec_replay_replacement = accepted.back();
+                        slot.spec_replay_sampler.reset(common_sampler_clone(slot.smpl.get()));
                         slot.spec_draft = std::move(accepted);
                         slot.spec_draft.pop_back();
 
