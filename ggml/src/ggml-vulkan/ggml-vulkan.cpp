@@ -2331,6 +2331,18 @@ class vk_perf_logger {
                 " (" << node->src[0]->ne[0] << "," << node->src[0]->ne[1] << "," << node->src[0]->ne[2] << "," << node->src[0]->ne[3] << ")";
             return name.str();
         }
+        if (getenv("GGML_VK_PERF_SHAPES")) {
+            std::stringstream name;
+            name << fusion_str << ggml_op_name(node->op) << " node=" << node->name
+                 << " dst=" << ggml_type_name(node->type) << "[" << node->ne[0] << "," << node->ne[1]
+                 << "," << node->ne[2] << "," << node->ne[3] << "]";
+            for (int i = 0; i < GGML_MAX_SRC && node->src[i]; ++i) {
+                const ggml_tensor * src = node->src[i];
+                name << " s" << i << "=" << src->name << ":" << ggml_type_name(src->type)
+                     << "[" << src->ne[0] << "," << src->ne[1] << "," << src->ne[2] << "," << src->ne[3] << "]";
+            }
+            return name.str();
+        }
         return fusion_str + ggml_op_name(node->op);
     }
 
