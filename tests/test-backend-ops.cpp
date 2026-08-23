@@ -10109,6 +10109,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         128, 64, 9472, 1020, 1, 1, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_lightning_indexer(
         128, 64, 17408, 1020, 1, 1, GGML_TYPE_Q8_0));
+    // Current selective-Q4 dense prefill projections. These gate the optional
+    // f16-B cooperative path at safe profiler and production ubatch widths.
+    for (int n : { 512, 1024, 3072 }) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, n, 4096, {8, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 32768, n, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 8192, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, n, 4096, {1, 1}, {1, 1}));
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
