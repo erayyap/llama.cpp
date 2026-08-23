@@ -10093,6 +10093,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
     }
+    // Production prefill uses 1024-token chunks in the safe profiler and up to
+    // 3072 tokens in production. Cover both DSV4 expert projections at those widths.
+    for (int n : { 512, 1024, 3072 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
+    }
+    // Current Q4-stack sparse-prefill shape: ~32K raw context becomes roughly
+    // 9.5K compressed rows, with a 1.5K exact/raw prefix and top-512 selection.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(
+        9472, 1020, 1536, 512, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(
+        17408, 1020, 1536, 512, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_lightning_indexer(
+        128, 64, 9472, 1020, 1, 1, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_lightning_indexer(
+        128, 64, 17408, 1020, 1, 1, GGML_TYPE_Q8_0));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
