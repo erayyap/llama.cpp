@@ -4329,6 +4329,20 @@ static bool ggml_vk_dense_q4_f16b_512_3072_enabled(const vk_device & device) {
            device->properties.deviceID == 0x1586;
 }
 
+static bool ggml_vk_dense_q4_f16b_32768_1024_enabled(const vk_device & device) {
+    static const int env_override = [] {
+        const char * env = getenv("GGML_VK_DENSE_Q4_F16B_32768_1024");
+        return env == nullptr ? -1 : (atoi(env) != 0 ? 1 : 0);
+    }();
+    if (env_override >= 0) {
+        return env_override != 0;
+    }
+    return device->vendor_id == VK_VENDOR_ID_AMD &&
+           device->driver_id == vk::DriverId::eMesaRadv &&
+           device->architecture == vk_device_architecture::AMD_RDNA3 &&
+           device->properties.deviceID == 0x1586;
+}
+
 static bool ggml_vk_q8_dmmv_rows4_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_VK_Q8_DMMV_ROWS4");
@@ -9840,10 +9854,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf.
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
+    const bool dense_q4_f16b_shape =
+        (ne01 == 512 && ne10 == 4096 && ne11 == 3072) ||
+        (ggml_vk_dense_q4_f16b_32768_1024_enabled(ctx->device) && ne01 == 32768 && ne10 == 1024 && ne11 == 3072);
     const bool dense_q4_f16b = ggml_vk_dense_q4_f16b_512_3072_enabled(ctx->device) &&
                                ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                                src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 &&
-                               ne01 == 512 && ne10 == 4096 && ne11 == 3072;
+                               dense_q4_f16b_shape;
     const bool y_non_contig = dense_q4_f16b ||
                               (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||

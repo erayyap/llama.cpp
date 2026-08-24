@@ -10067,6 +10067,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 3072, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 32768, 3072, 1024, {1, 1}, {1, 1}));
 
     return test_cases;
 }
@@ -10270,6 +10272,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 3072, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 32768, 3072, 1024, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
