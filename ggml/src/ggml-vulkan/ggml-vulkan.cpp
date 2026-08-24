@@ -8322,9 +8322,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return pipelines;
     }
 
-    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2 &&
-        !(src0_type == GGML_TYPE_Q4_K && src1_type == GGML_TYPE_F16 &&
-          ggml_vk_dense_q4_f16b_512_3072_enabled(ctx->device))) {
+    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2) {
         return nullptr;
     }
 
@@ -8362,11 +8360,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        vk_matmul_pipeline2 & pipelines = src1_type == GGML_TYPE_F16
-            ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
-            : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
         return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT)
-            ? pipelines.f16acc : pipelines.f32acc;
+            ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc
+            : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
@@ -9877,8 +9873,19 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
 
     if (mmp == nullptr) {
-        // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        // The shape-gated F16-B path has a deliberately sparse pipeline family
+        // (aligned-large only), so select it here rather than advertising generic
+        // Q4_K/F16 support to unrelated small direct-F16 graph operations.
+        if (dense_q4_f16b) {
+            auto & pipelines = ctx->device->pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K];
+            mmp = (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support &&
+                   (ggml_prec) dst->op_params[0] == GGML_PREC_DEFAULT)
+                ? pipelines.f16acc : pipelines.f32acc;
+        } else {
+            // Fall back to f16 dequant mul mat
+            mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type,
+                y_non_contig ? f16_type : src1->type, (ggml_prec) dst->op_params[0]);
+        }
         quantize_y = false;
     }
 
