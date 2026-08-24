@@ -10062,9 +10062,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, GGML_TYPE_F16));
     }
 
-    // Exact shape-gated IQ2_XXS BN16/BM64 DSV4 prefill cell.
+    // Exact shape-gated DSV4 prefill cells.
     test_cases.emplace_back(new test_mul_mat_id(
         GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 3072, 4096, {1, 1}, {1, 1}));
 
     return test_cases;
 }
@@ -10266,6 +10268,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, bs, 2048, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, bs, 4096, {1, 1}, {1, 1}));
     }
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 3072, 4096, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

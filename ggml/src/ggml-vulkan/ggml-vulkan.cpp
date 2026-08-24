@@ -4313,6 +4313,22 @@ static bool ggml_vk_mmid_iq2_tile16_512_enabled(const vk_device & device) {
            device->properties.deviceID == 0x1586;  // Radeon 8060S / gfx1151
 }
 
+// Shape-specialized dense Q4_K F16-B screen. The f32-B shader stages values as
+// f16 in shared memory already; converting once up front reduces B traffic.
+static bool ggml_vk_dense_q4_f16b_512_3072_enabled(const vk_device & device) {
+    static const int env_override = [] {
+        const char * env = getenv("GGML_VK_DENSE_Q4_F16B_512_3072");
+        return env == nullptr ? -1 : (atoi(env) != 0 ? 1 : 0);
+    }();
+    if (env_override >= 0) {
+        return env_override != 0;
+    }
+    return device->vendor_id == VK_VENDOR_ID_AMD &&
+           device->driver_id == vk::DriverId::eMesaRadv &&
+           device->architecture == vk_device_architecture::AMD_RDNA3 &&
+           device->properties.deviceID == 0x1586;
+}
+
 static bool ggml_vk_q8_dmmv_rows4_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_VK_Q8_DMMV_ROWS4");
@@ -5019,6 +5035,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K], matmul_q2_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K], matmul_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        // Only the aligned-large F16-B pipeline is reachable from the exact
+        // Q4_K m512/n3072/k4096 gate; avoid compiling unused variants.
+        if (device->coopmat_acc_f16_support && device->mul_mat_l[GGML_TYPE_Q4_K]) {
+            ggml_vk_create_pipeline(device,
+                device->pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K].f16acc->a_l,
+                "matmul_q4_k_f16_f16acc_512_3072_aligned_l",
+                matmul_q4_k_f16_f16acc_cm1_len, matmul_q4_k_f16_f16acc_cm1_data,
+                "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms,
+                ggml_vk_mul_mm_spec(l_warptile_mmq, true), l_align, false, true,
+                dense_req_sgs(l_warptile_mmq));
+        }
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -8281,7 +8308,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return pipelines;
     }
 
-    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2) {
+    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2 &&
+        !(src0_type == GGML_TYPE_Q4_K && src1_type == GGML_TYPE_F16 &&
+          ggml_vk_dense_q4_f16b_512_3072_enabled(ctx->device))) {
         return nullptr;
     }
 
@@ -8319,7 +8348,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+        vk_matmul_pipeline2 & pipelines = src1_type == GGML_TYPE_F16
+            ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
+            : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
+        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT)
+            ? pipelines.f16acc : pipelines.f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
@@ -9804,10 +9837,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
+    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf.
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    const bool dense_q4_f16b = ggml_vk_dense_q4_f16b_512_3072_enabled(ctx->device) &&
+                               ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+                               src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 &&
+                               ne01 == 512 && ne10 == 4096 && ne11 == 3072;
+    const bool y_non_contig = dense_q4_f16b ||
+                              (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
                               !ggml_vk_dim01_contiguous(src1);
 
@@ -9844,6 +9882,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+
+    static const char * mulmat_probe_env = getenv("GGML_VK_MULMAT_PROBE");
+    if (mulmat_probe_env && atoi(mulmat_probe_env) != 0) {
+        static std::set<std::string> seen;
+        std::string key = pipeline->name + ":" + std::to_string(ne01) + ":" + std::to_string(ne11) + ":" + std::to_string(ne10);
+        if (seen.insert(key).second) {
+            fprintf(stderr, "ggml_vulkan: mulmat pipeline=%s m=%u n=%u k=%u wg=(%u,%u,%u)\n",
+                    pipeline->name.c_str(), (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10,
+                    pipeline->wg_denoms[0], pipeline->wg_denoms[1], pipeline->wg_denoms[2]);
+        }
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
