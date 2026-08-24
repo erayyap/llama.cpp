@@ -878,6 +878,9 @@ struct vk_device_struct {
     // devices (upstream only builds f32-B there). Populated only when the env flag
     // is set; empty otherwise.
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
+    // Shape-specialized IQ2_XXS f16-B MMID tile: BN16/BM64 for the exact
+    // 256-expert, top-6, m2048/k4096, n512 DSV4 prefill cell.
+    vk_pipeline pipeline_mmid_iq2_tile16_512_f16b;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
@@ -4293,6 +4296,23 @@ static bool ggml_vk_mmid_f16b_enabled() {
     return enabled;
 }
 
+// Exact-shape IQ2_XXS BN16 selector. Both baseline and candidate pipelines are
+// embedded so this can be toggled in one binary without affecting Q2_K or other
+// prefill widths. Default-on only for the validated RADV Strix Halo target.
+static bool ggml_vk_mmid_iq2_tile16_512_enabled(const vk_device & device) {
+    static const int env_override = [] {
+        const char * env = getenv("GGML_VK_MMID_IQ2_TILE16_512");
+        return env == nullptr ? -1 : (atoi(env) != 0 ? 1 : 0);
+    }();
+    if (env_override >= 0) {
+        return env_override != 0;
+    }
+    return device->vendor_id == VK_VENDOR_ID_AMD &&
+           device->driver_id == vk::DriverId::eMesaRadv &&
+           device->architecture == vk_device_architecture::AMD_RDNA3 &&
+           device->properties.deviceID == 0x1586;  // Radeon 8060S / gfx1151
+}
+
 static bool ggml_vk_q8_dmmv_rows4_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_VK_Q8_DMMV_ROWS4");
@@ -5040,6 +5060,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Shadows the s-tile config for the mmid quant pipelines only; dense unaffected.
         auto s_warptile_mmq_id16 = s_warptile_mmq;
         auto s_mmq_wg_denoms_id16 = s_mmq_wg_denoms;
+        auto s_warptile_mmq_iq2_tile16 = s_warptile_mmq;
+        auto s_mmq_wg_denoms_iq2_tile16 = s_mmq_wg_denoms;
+        s_warptile_mmq_iq2_tile16[2] = 16;  // BN
+        s_warptile_mmq_iq2_tile16[5] = 16;  // WN
+        s_mmq_wg_denoms_iq2_tile16[1] = 16;
         auto m_warptile_mmq_id128 = m_warptile_mmq;
         auto m_mmq_wg_denoms_id128 = m_mmq_wg_denoms;
         auto l_warptile_mmq_idw = l_warptile_mmq;
@@ -5059,6 +5084,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 s_warptile_mmq_id16[0] = 2 * mul_mat_subgroup_size;  // BLOCK_SIZE
                 s_warptile_mmq_id16[1] = 64;  // BM
                 s_mmq_wg_denoms_id16[0] = 64;
+                s_warptile_mmq_iq2_tile16[0] = 2 * mul_mat_subgroup_size;
+                s_warptile_mmq_iq2_tile16[1] = 64;
+                s_mmq_wg_denoms_iq2_tile16[0] = 64;
             }
             // GGML_VK_MMID_M128=1: same idea for the medium tile (BM 64->128, four
             // warps) — the tile the per-expert-n heuristic picks at n~64 (e.g. ub2048).
@@ -5102,6 +5130,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     GGML_ASSERT(w[4] >= w[7] && w[5] >= w[8]);                   // WM >= TM, WN >= TN
                 };
                 wave32_tile(s_warptile_mmq_id16);
+                wave32_tile(s_warptile_mmq_iq2_tile16);
                 wave32_tile(m_warptile_mmq_id128);
                 wave32_tile(l_warptile_mmq_idw);
             }
@@ -5190,6 +5219,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+
+        // Keep only the aligned-small IQ2_XXS f16-B pipeline needed by the
+        // exact DSV4 n512 cell. Avoid compiling unused medium/large variants.
+        if (device->coopmat_acc_f16_support && device->mul_mat_id_s[GGML_TYPE_IQ2_XXS]) {
+            ggml_vk_create_pipeline(device, device->pipeline_mmid_iq2_tile16_512_f16b,
+                "matmul_id_subgroup_iq2_xxs_f16_f16acc_tile16_512_aligned_s",
+                matmul_id_subgroup_iq2_xxs_f16_f16acc_cm1_len,
+                matmul_id_subgroup_iq2_xxs_f16_f16acc_cm1_data,
+                "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants),
+                s_mmq_wg_denoms_iq2_tile16,
+                ggml_vk_mul_mm_spec(s_warptile_mmq_iq2_tile16, true), s_align,
+                false, true, mmid_req_sgs);
+        }
         }
         }
 
@@ -10767,10 +10809,17 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         n_for_tile = std::max<uint32_t>(1u, (uint32_t)((nei1 * nei0 + ne02 - 1) / ne02));
     }
 
+    const bool use_iq2_tile16_512 = ggml_vk_mmid_iq2_tile16_512_enabled(ctx->device) && mmid_f16b &&
+        src0->type == GGML_TYPE_IQ2_XXS && ne01 == 2048 && ne10 == 4096 && ne02 == 256 &&
+        nei0 == 6 && nei1 == 512 && ctx->device->pipeline_mmid_iq2_tile16_512_f16b;
+
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, n_for_tile, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, n_for_tile, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    if (use_iq2_tile16_512 && aligned) {
+        pipeline = ctx->device->pipeline_mmid_iq2_tile16_512_f16b;
+    }
 
     // PROBE (GGML_VK_MMID_PROBE=1): which mmid tile actually runs, and with how many threads.
     static const char * mmid_probe_env = getenv("GGML_VK_MMID_PROBE");

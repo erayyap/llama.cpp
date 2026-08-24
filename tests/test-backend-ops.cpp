@@ -10062,6 +10062,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, GGML_TYPE_F16));
     }
 
+    // Exact shape-gated IQ2_XXS BN16/BM64 DSV4 prefill cell.
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -10090,6 +10094,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // DeepSeek V4 exact small speculative-verification MoE shapes.
     for (int n : { 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
+    }
+    // Exact DSV4 prefill cells used by shape-specialized MMID tile selection.
+    for (int n : { 256, 512, 1024 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
     }
