@@ -11,8 +11,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
     const uint y_idx = i * QUANT_K + 16 * itid;
     const uint ib32 = itid / 2; // 0..7
 
+#ifndef MMID_IQ2_TM64
     uint ibi = a_offset + first_row * num_blocks_per_row + i;
+#endif
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef MMID_IQ2_TM64
+        const uint logical_row = first_row + n;
+        const uint ibi = a_offset + ((logical_row / 64 * num_blocks_per_row + i) * 64 + logical_row % 64);
+#endif
         const float d = float(data_a[ibi].d);
         const uint signscale = pack32(u16vec2(
             data_a_packed16[ibi].qs[4 * ib32 + 2],
@@ -42,7 +48,9 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
                 temp[j][n] = fma(db, sum, temp[j][n]);
             }
         }
+#ifndef MMID_IQ2_TM64
         ibi += num_blocks_per_row;
+#endif
     }
 }
 

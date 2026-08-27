@@ -608,7 +608,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
 
         if (tname != "f16" && tname != "f32") {
-            string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            const auto f16_defines = merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}});
+            string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name, f16_defines, fp16, coopmat, coopmat2, f16acc);
+            if (matmul_id_type == MatMulIdType::SUBGROUP && tname == "iq2_xxs" && fp16 && coopmat && !coopmat2 && f16acc && !dot2) {
+                string_to_spv(shader_name + "_iq2_xxs_tm64_f16", source_name, merge_maps(f16_defines, {{"MMID_IQ2_TM64", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
         }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
@@ -761,6 +765,12 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        if (tname == "iq2_xxs") {
+            const auto tm64_defines = merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"MMID_IQ2_TM64", "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+            string_to_spv("mul_mat_vec_id_iq2_xxs_tm64_f32_f32", shader, tm64_defines);
+            string_to_spv("mul_mat_vec_id_iq2_xxs_tm64_f32_f32_subgroup", shader, merge_maps(tm64_defines, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_iq2_xxs_tm64_f32_f32_subgroup_no_shmem", shader, merge_maps(tm64_defines, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
 
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
@@ -1304,6 +1314,13 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
     }
+    }
+
+    hdr << "extern const void * arr_dmmv_id_iq2_xxs_tm64_f32_f32_data[3];\n";
+    hdr << "extern const uint64_t arr_dmmv_id_iq2_xxs_tm64_f32_f32_len[3];\n";
+    if (basename(input_filepath) == "mul_mat_vec.comp") {
+        src << "const void * arr_dmmv_id_iq2_xxs_tm64_f32_f32_data[3] = {mul_mat_vec_id_iq2_xxs_tm64_f32_f32_data, mul_mat_vec_id_iq2_xxs_tm64_f32_f32_subgroup_data, mul_mat_vec_id_iq2_xxs_tm64_f32_f32_subgroup_no_shmem_data};\n";
+        src << "const uint64_t arr_dmmv_id_iq2_xxs_tm64_f32_f32_len[3] = {mul_mat_vec_id_iq2_xxs_tm64_f32_f32_len, mul_mat_vec_id_iq2_xxs_tm64_f32_f32_subgroup_len, mul_mat_vec_id_iq2_xxs_tm64_f32_f32_subgroup_no_shmem_len};\n";
     }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)

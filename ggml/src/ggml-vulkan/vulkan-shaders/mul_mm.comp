@@ -154,6 +154,11 @@ shared vec2 scache_dm[BM * 8];
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
+#ifdef MMID_IQ2_TM64
+uint mmid_iq2_tm64_expert;
+uint mmid_iq2_tm64_ir;
+#endif
+
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
 
@@ -185,6 +190,10 @@ void main() {
     const uint blocks_m = (p.M + BM - 1) / BM;
     const uint ir = gl_WorkGroupID.x % blocks_m;
     const uint ik = gl_WorkGroupID.x / blocks_m;
+#ifdef MMID_IQ2_TM64
+    mmid_iq2_tm64_expert = expert_idx;
+    mmid_iq2_tm64_ir = ir;
+#endif
 
     const uint WNITER = (WM * WN) / (WARP * TM * TN * WMITER);
     const uint WSUBM = WM / WMITER;

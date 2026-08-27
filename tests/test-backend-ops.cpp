@@ -59,7 +59,8 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         static const size_t n_threads = N_THREADS;
 
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            const char * seed_env = getenv("GGML_TEST_SEED");
+            std::default_random_engine gen(seed_env ? (unsigned int)(strtoul(seed_env, nullptr, 10) ^ start) : std::random_device{}());
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -85,12 +86,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
     } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
-        GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
+        const ggml_type quant_type = tensor->type == GGML_TYPE_IQ2_XXS_TM64 ? GGML_TYPE_IQ2_XXS : tensor->type;
+        GGML_ASSERT(nels % ggml_blck_size(quant_type) == 0);
 
          // dummy importance matrix
         std::vector<float> imatrix(tensor->ne[0], 1.0f);
         const float * im = imatrix.data();
-        if (!ggml_quantize_requires_imatrix(tensor->type)) {
+        if (!ggml_quantize_requires_imatrix(quant_type)) {
             // when the imatrix is optional, we want to test both quantization with and without imatrix
             // use one of the random numbers to decide
             if (data[0] > 0.5f*(min + max)) {
@@ -98,14 +100,14 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        std::vector<uint8_t> dataq(ggml_row_size(quant_type, nels));
         {
             // parallel quantization by block
-            size_t blck_size = ggml_blck_size(tensor->type);
+            size_t blck_size = ggml_blck_size(quant_type);
             size_t n_blocks = nels / blck_size;
 
             auto quantize_thread = [&](size_t start, size_t end) {
-                ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
+                ggml_quantize_chunk(quant_type, data.data(), dataq.data(),
                     start * blck_size, end - start, blck_size, im);
             };
 
@@ -128,6 +130,25 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                     t.get();
                 }
             }
+        }
+        if (tensor->type == GGML_TYPE_IQ2_XXS_TM64) {
+            GGML_ASSERT(tensor->ne[0] == 4096 && tensor->ne[1] == 2048 && tensor->ne[2] == 256);
+            constexpr size_t block_bytes = 66;
+            constexpr size_t bm = 64;
+            const size_t k_blocks = tensor->ne[0] / 256;
+            const size_t m = tensor->ne[1];
+            const size_t experts = tensor->ne[2];
+            std::vector<uint8_t> packed(dataq.size());
+            for (size_t expert = 0; expert < experts; ++expert) {
+                for (size_t row = 0; row < m; ++row) {
+                    for (size_t kb = 0; kb < k_blocks; ++kb) {
+                        const size_t src = ((expert * m + row) * k_blocks + kb) * block_bytes;
+                        const size_t dst = (((expert * (m / bm) + row / bm) * k_blocks + kb) * bm + row % bm) * block_bytes;
+                        memcpy(packed.data() + dst, dataq.data() + src, block_bytes);
+                    }
+                }
+            }
+            dataq.swap(packed);
         }
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
     } else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16) {
@@ -1572,6 +1593,15 @@ struct test_case {
         if (status != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
+        }
+        if (getenv("GGML_TEST_OUTPUT_HASH")) {
+            std::vector<uint8_t> output(ggml_nbytes(out));
+            ggml_backend_tensor_get(out, output.data(), 0, output.size());
+            uint64_t hash = 1469598103934665603ULL;
+            for (uint8_t byte : output) {
+                hash = (hash ^ byte) * 1099511628211ULL;
+            }
+            fprintf(stderr, "GGML_TEST_OUTPUT_FNV64=%016" PRIx64 " bytes=%zu\n", hash, output.size());
         }
 
         // determine number of runs
@@ -4405,8 +4435,8 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    const char * seed_env = getenv("GGML_TEST_SEED");
+    std::default_random_engine rng(seed_env ? (unsigned int)strtoul(seed_env, nullptr, 10) : std::random_device{}());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
@@ -10066,6 +10096,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Exact shape-gated DSV4 prefill cells.
+    for (int n : { 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
+    }
     test_cases.emplace_back(new test_mul_mat_id(
         GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
     test_cases.emplace_back(new test_mul_mat(
@@ -10108,9 +10142,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
     }
     // Exact DSV4 prefill cells used by shape-specialized MMID tile selection.
-    for (int n : { 256, 512, 1024 }) {
+    for (int n : { 256, 512, 1024, 2286, 3072 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
+    }
+    for (int n : { 2, 3, 4, 5, 256, 512, 1024, 2286, 3072 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS_TM64, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
     }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance

@@ -4987,8 +4987,9 @@ class GGMLQuantizationType(IntEnum):
     TQ2_0   = 35
     MXFP4   = 39
     NVFP4   = 40
-    Q1_0    = 41
-    Q2_0    = 42
+    Q1_0          = 41
+    Q2_0          = 42
+    IQ2_XXS_TM64  = 43
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5155,7 +5156,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q5_K:    (256, 2 + 2 + QK_K // 2 + QK_K // 8 + 12),
     GGMLQuantizationType.Q6_K:    (256, 2 + QK_K // 2 + QK_K // 4 + QK_K // 16),
     GGMLQuantizationType.Q8_K:    (256, 4 + QK_K + QK_K // 8),
-    GGMLQuantizationType.IQ2_XXS: (256, 2 + QK_K // 4),
+    GGMLQuantizationType.IQ2_XXS:      (256, 2 + QK_K // 4),
+    GGMLQuantizationType.IQ2_XXS_TM64: (256, 2 + QK_K // 4),
     GGMLQuantizationType.IQ2_XS:  (256, 2 + QK_K // 4 + QK_K // 32),
     GGMLQuantizationType.IQ3_XXS: (256, 2 + QK_K // 4 + QK_K // 8),
     GGMLQuantizationType.IQ1_S:   (256, 2 + QK_K // 8 + QK_K // 16),

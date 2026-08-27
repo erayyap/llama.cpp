@@ -359,12 +359,19 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                                   dl * (bitfieldExtract(grid, 4 * k + 2, 2) + delta));
             }
 #elif defined(DATA_A_IQ2_XXS)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
-
+#ifdef MMID_IQ2_TM64
+            const uint group = ((block & 255) / LOAD_VEC_A) + row;
+            const uint ib32 = group / 4;
+            const uint ib8 = group & 3;
+            const uint global_row = mmid_iq2_tm64_ir * BM + col;
+            const uint ib = (((mmid_iq2_tm64_expert * (p.M / 64) + global_row / 64) * (p.K / 256) + block / 256) * 64 + global_row % 64);
+#else
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint ib = idx / 32;                 // 8 values per idx
             const uint ib32 = (idx % 32) / 4;         // 0..7
             const uint ib8 = idx % 4;
+#endif
 
             const float d = float(data_a[ib].d);
             const uint qs = data_a[ib].qs[8 * ib32 + ib8];

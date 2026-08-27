@@ -812,6 +812,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xxs,
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_IQ2_XXS_TM64] = {
+        .type_name                = "iq2_xxs_tm64",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq2_xxs),
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_IQ2_XS] = {
         .type_name                = "iq2_xs",
         .blck_size                = QK_K,
